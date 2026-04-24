@@ -1,0 +1,39 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/dist
+/pkg
+*.wasm
+
+# Local export output
+/out
+*.png
+*.exr
+!assets/**/*.png
+!assets/**/*.exr
+!docs/**/*.png
+
+# Logs
+*.log
+
+# Generated docs
+/target/doc
+compass_artifact_wf-112109fa-fb22-4a7d-92e0-0ba314232db7_text_markdown.md
+
+# Environment
+.env
+.env.local

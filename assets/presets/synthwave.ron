@@ -1,0 +1,6 @@
+// Synthwave preset: magenta -> cyan -> deep blue gradient, strong bloom.
+// Placeholder — actual values populated in Phase 4.
+(
+    format_version: 1,
+    name: "Synthwave",
+)

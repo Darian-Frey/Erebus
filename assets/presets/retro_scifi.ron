@@ -1,0 +1,6 @@
+// Retro sci-fi preset: amber -> teal -> burgundy gradient, soft bloom.
+// Placeholder — actual values populated in Phase 4.
+(
+    format_version: 1,
+    name: "Retro Sci-Fi",
+)
