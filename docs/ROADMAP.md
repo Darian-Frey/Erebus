@@ -15,26 +15,27 @@ The ordering is deliberate: get pixels on screen before polishing UI, get HDR ri
 - [x] Dual MIT / Apache-2.0 license.
 - [x] `.gitignore`, `rustfmt.toml`, `rust-toolchain.toml`.
 - [x] GitHub Actions CI: fmt, clippy, test, wasm-check.
-- [ ] `cargo run` opens a blank `eframe` window with a clear-color pass.
+- [x] `cargo run` opens an `eframe` window — done as part of Phase 1 below.
 
 **Exit:** `cargo build --release` succeeds on Linux/macOS/Windows; CI green.
 
 ---
 
-## Phase 1 — Render plumbing (M1)
+## Phase 1 — Render plumbing (M1) ✅
 
 **Goal:** a fullscreen WGSL shader rendering into HDR RGBA16F, hot-reloadable.
 
-- [ ] `render::context` initializes `wgpu::Instance/Adapter/Device/Queue` with required limits (`max_texture_dimension_2d ≥ 8192`, `max_storage_buffers_per_shader_stage`).
-- [ ] `render::resources::textures` allocates the HDR RGBA16F render target and a depth-less swapchain blit pass.
-- [ ] `shaders/fullscreen.wgsl` (oversized triangle) wired to a debug fragment shader that draws UV gradient.
-- [ ] `render::hot_reload` watches `shaders/**/*.wgsl` (notify crate) and rebuilds shader modules; Naga errors surface in an egui toast.
-- [ ] `render::uniforms` skeleton: `FrameUniforms` (resolution, time, exposure, seed).
-- [ ] Preview shows the gradient at the chosen viewport resolution; resizing works.
+- [x] `render::context` exposes the shader-source root; eframe owns device/queue/adapter init.
+- [x] `render::resources::textures::HdrTarget` allocates the HDR RGBA16F target and resizes on viewport change.
+- [x] `shaders/fullscreen.wgsl` (oversized triangle) + Phase 1 placeholder fragment in `shaders/nebula/raymarch.wgsl` (UV+time gradient).
+- [x] `render::hot_reload::ShaderWatcher` (notify, 150 ms debounce). Naga front-end validates before pipeline rebuild; errors surface in a bottom panel without crashing the app.
+- [x] `render::uniforms::FrameUniforms` (resolution, time, exposure, seed) with C-layout matched WGSL.
+- [x] `tests/wgsl_validation.rs` parses every shader through Naga in CI.
+- [x] Preview shows the gradient via egui paint callback; resizing works (HDR target rebuilt on size change).
 
-**Exit:** edit a WGSL file → preview updates within 1 s without app restart.
+**Exit:** edit a WGSL file → preview updates within ~150 ms without app restart. ✅
 
-**Risks:** wgpu/eframe surface sharing — pin known-good versions early.
+**Risks:** wgpu/eframe surface sharing — pinned to wgpu 0.20 / eframe 0.28 / egui 0.28.
 
 ---
 

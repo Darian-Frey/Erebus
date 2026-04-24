@@ -12,8 +12,7 @@ categories = ["graphics", "rendering", "multimedia::images"]
 
 [dependencies]
 wgpu = "0.20"
-winit = "0.30"
-eframe = { version = "0.28", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
+eframe = { version = "0.28", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
 egui = "0.28"
 egui-wgpu = "0.28"
 bytemuck = { version = "1.16", features = ["derive"] }

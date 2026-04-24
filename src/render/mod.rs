@@ -7,3 +7,6 @@ pub mod uniforms;
 pub mod hot_reload;
 pub mod passes;
 pub mod resources;
+
+pub use graph::ErebusRenderer;
+pub use uniforms::FrameUniforms;
