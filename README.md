@@ -39,7 +39,7 @@ wasm-bindgen --target web --out-dir dist target/wasm32-unknown-unknown/release/e
 
 ## Repository layout
 
-```
+```text
 Erebus/
 ├── src/
 │   ├── main.rs             # Entry point.
@@ -66,7 +66,8 @@ Erebus/
 ├── docs/
 │   ├── ROADMAP.md          # Phase-by-phase development plan.
 │   ├── ARCHITECTURE.md     # Render graph and data flow.
-│   └── SHADER_NOTES.md     # Tuning notes for each pass.
+│   ├── SHADER_NOTES.md     # Tuning notes for each pass.
+│   └── BUGS.md             # Bug log: symptom, root cause, fix.
 ├── examples/               # Headless export, CLI reference.
 ├── tests/                  # Preset round-trip, WGSL Naga validation.
 ├── benches/                # GPU timing harness.
