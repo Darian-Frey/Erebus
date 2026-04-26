@@ -18,9 +18,12 @@ struct Frame {
     exposure: f32,
     seed: u32,
     frame_index: u32,
-    _pad0: u32,
-    _pad1: u32,
+    mode: u32,        // 0 = equirect, 1 = cubemap
+    cube_face: u32,   // 0..6 when mode == 1
 };
+
+const MODE_EQUIRECT: u32 = 0u;
+const MODE_CUBEMAP: u32 = 1u;
 
 struct Nebula {
     density_scale: f32,
@@ -116,6 +119,32 @@ fn equirect_dir(uv: vec2<f32>) -> vec3<f32> {
     let theta = (uv.y - 0.5) * PI;
     let cos_theta = cos(theta);
     return vec3<f32>(cos_theta * sin(phi), sin(theta), cos_theta * cos(phi));
+}
+
+// 90°-FOV perspective ray for a single cube face. Convention matches the
+// canonical OpenGL / DirectX cubemap layout (+X, -X, +Y, -Y, +Z, -Z) so the
+// six exported PNGs drop straight into Unity / Unreal / Bevy / Godot
+// cubemap importers without per-face flipping.
+fn cube_dir(uv: vec2<f32>, face: u32) -> vec3<f32> {
+    let s = uv.x * 2.0 - 1.0;
+    let t = 1.0 - uv.y * 2.0;
+    var d: vec3<f32>;
+    switch face {
+        case 0u: { d = vec3<f32>( 1.0,    t,   -s); }  // +X
+        case 1u: { d = vec3<f32>(-1.0,    t,    s); }  // -X
+        case 2u: { d = vec3<f32>(   s,  1.0,   -t); }  // +Y
+        case 3u: { d = vec3<f32>(   s, -1.0,    t); }  // -Y
+        case 4u: { d = vec3<f32>(   s,    t,  1.0); }  // +Z
+        default: { d = vec3<f32>(  -s,    t, -1.0); }  // -Z
+    }
+    return normalize(d);
+}
+
+fn ray_dir(uv: vec2<f32>) -> vec3<f32> {
+    if (frame.mode == MODE_CUBEMAP) {
+        return cube_dir(uv, frame.cube_face);
+    }
+    return equirect_dir(uv);
 }
 
 // World position → noise-volume texture coords. REPEAT addressing on the
@@ -256,8 +285,8 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
     let core_falloff = scale * scale * 100.0;
     let core = exp(-ang_sq * core_falloff) * mag;
 
-    // 4-spoke diffraction cross for stars above the PSF threshold. Phase 5
-    // will replace this with a proper N-fold spike pattern + FFT bloom.
+    // Diffraction spikes. Length is clamped to half the cell angular size so
+    // the cross fits inside one cell and never gets truncated at a boundary.
     var spikes: f32 = 0.0;
     if (mag > starfield.psf_threshold) {
         let delta = dir - star_dir;
@@ -274,8 +303,9 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
         let dy = dot(delta, ty);
         let ax = abs(dx);
         let ay = abs(dy);
-        let h_spike = exp(-ay * 600.0) * smoothstep(starfield.spike_length, 0.0, ax);
-        let v_spike = exp(-ax * 600.0) * smoothstep(starfield.spike_length, 0.0, ay);
+        let len = min(starfield.spike_length, 0.5 / scale);
+        let h_spike = exp(-ay * 600.0) * smoothstep(len, 0.0, ax);
+        let v_spike = exp(-ax * 600.0) * smoothstep(len, 0.0, ay);
         spikes = max(h_spike, v_spike) * starfield.psf_intensity * mag;
     }
 
@@ -311,7 +341,7 @@ struct FsIn {
 
 @fragment
 fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
-    let dir = equirect_dir(in.uv);
+    let dir = ray_dir(in.uv);
     let origin = vec3<f32>(0.0);
 
     let steps = max(nebula.steps, 1u);
@@ -337,7 +367,10 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
             let absorbed = 1.0 - exp(-optical);
 
             let lut_t = clamp(pow(d, nebula.density_curve), 0.0, 1.0);
-            let albedo_color = textureSample(gradient_tex, gradient_sampler, lut_t).rgb;
+            // textureSampleLevel (not textureSample) because we're inside
+            // non-uniform control flow (loop with break). WebGPU's strict
+            // spec rejects implicit-LOD textureSample from divergent paths.
+            let albedo_color = textureSampleLevel(gradient_tex, gradient_sampler, lut_t, 0.0).rgb;
 
             var in_scatter = vec3<f32>(0.0);
             if (d > 0.05 && lighting.count > 0u) {

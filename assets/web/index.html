@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Erebus — procedural nebula generator</title>
+    <style>
+        :root { color-scheme: dark; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+            color: #ddd;
+            overflow: hidden;
+        }
+        /* eframe expects the canvas to fill its host. tabindex=0 makes it focusable for keyboard input. */
+        #erebus-canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            outline: none;
+            background: #000;
+        }
+        #fallback {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 2rem;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        #fallback h1 { color: #c040a0; font-weight: 600; margin-bottom: 0.5em; }
+        #fallback a { color: #c0a0ff; }
+        #fallback code { background: #222; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+        body.no-webgpu #erebus-canvas { display: none; }
+        body.no-webgpu #fallback { display: flex; }
+
+        #panic {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: #5a1010;
+            color: #ffeaea;
+            padding: 1rem;
+            font-family: ui-monospace, "Menlo", monospace;
+            font-size: 0.85em;
+            white-space: pre-wrap;
+            display: none;
+            max-height: 50vh;
+            overflow: auto;
+            z-index: 10;
+        }
+        #panic.visible { display: block; }
+    </style>
+</head>
+<body>
+    <canvas id="erebus-canvas" tabindex="0"></canvas>
+    <div id="fallback">
+        <h1>Erebus needs WebGPU.</h1>
+        <p>Your browser doesn't expose <code>navigator.gpu</code>.</p>
+        <p>
+            Try Chrome 113+, Edge 113+, Safari 26+ (macOS), or Firefox 145+
+            (with WebGPU enabled), or grab the
+            <a href="https://github.com/Darian-Frey/Erebus">desktop build</a>.
+        </p>
+    </div>
+    <pre id="panic"></pre>
+    <div id="webgpu-help" style="display:none; position:absolute; top:0; left:0; right:0; padding:1rem; background:#1a1a40; color:#c0c0ff; font-family:ui-sans-serif,system-ui,sans-serif; font-size:0.95em; z-index:11;">
+        <b>WebGPU adapter not found.</b>
+        Chrome on Linux often hides the GPU adapter from WebGPU until you enable it manually:
+        <ol style="margin:0.5em 0 0.5em 1.5em;">
+            <li>Open <code>chrome://flags/#enable-unsafe-webgpu</code> → set <b>Enabled</b>.</li>
+            <li>Open <code>chrome://flags/#enable-vulkan</code> → set <b>Enabled</b>.</li>
+            <li>Click <b>Relaunch</b> at the bottom of the flags page.</li>
+        </ol>
+        Or try Firefox Nightly / Safari 26+. The desktop binary works without these flags.
+    </div>
+    <script type="module">
+        const panicEl = document.getElementById('panic');
+        const append = (prefix, args) => {
+            const txt = '[' + prefix + '] ' + args.map(a => {
+                if (a instanceof Error) return a.stack || a.message;
+                if (typeof a === 'object') {
+                    try { return JSON.stringify(a); } catch (_) { return String(a); }
+                }
+                return String(a);
+            }).join(' ');
+            panicEl.textContent += txt + '\n';
+            panicEl.classList.add('visible');
+            // Pop a friendlier hint for the most common Linux Chrome failure.
+            if (txt.includes('no suitable adapter found') || txt.includes('Failed to create wgpu adapter')) {
+                document.getElementById('webgpu-help').style.display = 'block';
+            }
+        };
+        // Mirror console.error / console.warn into the on-page banner so wgpu
+        // validation messages and Rust panic output are visible without DevTools.
+        const origError = console.error.bind(console);
+        const origWarn  = console.warn.bind(console);
+        console.error = (...args) => { append('error', args); origError(...args); };
+        console.warn  = (...args) => { append('warn',  args); origWarn(...args);  };
+        window.addEventListener('error', (ev) => {
+            append('window-error', [ev.error?.stack || ev.message || ev]);
+        });
+        window.addEventListener('unhandledrejection', (ev) => {
+            append('rejection', [ev.reason?.stack || ev.reason || ev]);
+        });
+
+        // Make the canvas's pixel buffer match its CSS-rendered size BEFORE
+        // eframe creates the wgpu surface — without this, wgpu sees the
+        // default 300×150 buffer and renders a tiny stretched frame that
+        // reads as black.
+        const sizeCanvas = () => {
+            const c = document.getElementById('erebus-canvas');
+            const dpr = window.devicePixelRatio || 1;
+            c.width = Math.round(window.innerWidth * dpr);
+            c.height = Math.round(window.innerHeight * dpr);
+        };
+        sizeCanvas();
+        window.addEventListener('resize', sizeCanvas);
+
+        if (!('gpu' in navigator)) {
+            document.body.classList.add('no-webgpu');
+        } else {
+            try {
+                const mod = await import('./erebus.js');
+                await mod.default();
+                mod.start('erebus-canvas');
+            } catch (err) {
+                append('startup-throw', [err]);
+            }
+        }
+    </script>
+</body>
+</html>

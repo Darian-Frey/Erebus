@@ -8,20 +8,32 @@
 pub mod png;
 pub mod tiling;
 pub mod exr;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cubemap;
 pub mod equirect;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Png,
+    Exr,
 }
 
 impl ExportFormat {
     pub fn extension(&self) -> &'static str {
         match self {
             ExportFormat::Png => "png",
+            ExportFormat::Exr => "exr",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExportFormat::Png => "PNG (sRGB tonemapped)",
+            ExportFormat::Exr => "EXR (linear HDR)",
         }
     }
 }
@@ -29,13 +41,24 @@ impl ExportFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportKind {
     Equirect,
+    Cubemap,
+}
+
+impl ExportKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExportKind::Equirect => "Equirect (2:1)",
+            ExportKind::Cubemap => "Cubemap (6 faces)",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ExportRequest {
     pub format: ExportFormat,
     pub kind: ExportKind,
-    /// Width of the output image in pixels. Equirect height = width / 2.
+    /// For equirect: width of the output image (height = width / 2).
+    /// For cubemap: per-face square dimension.
     pub width: u32,
     /// Optional pre-resolved destination path. If `None`, the update loop
     /// opens a file dialog before running the export.

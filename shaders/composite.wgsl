@@ -125,8 +125,8 @@ fn dither_triangular(uv: vec2<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
-    let scene = textureSample(hdr_tex, post_sampler, in.uv).rgb;
-    let bloom = textureSample(bloom_tex, post_sampler, in.uv).rgb;
+    let scene = textureSampleLevel(hdr_tex, post_sampler, in.uv, 0.0).rgb;
+    let bloom = textureSampleLevel(bloom_tex, post_sampler, in.uv, 0.0).rgb;
 
     var c = scene + bloom * post.bloom_intensity;
 
@@ -140,8 +140,12 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
         mapped = agx(c);
     } else if (post.tonemap_mode == 1u) {
         mapped = aces_fitted(c);
-    } else {
+    } else if (post.tonemap_mode == 2u) {
         mapped = reinhard(c);
+    } else {
+        // mode == 3: linear passthrough — used when writing EXR so the
+        // on-disk values are scene-referred radiance, not display-referred.
+        mapped = c;
     }
 
     let dither = dither_triangular(in.uv) * post.deband_amount;

@@ -1,7 +1,7 @@
 // Phase 2 panel surface: Frame + Nebula sliders. More groups land in
 // Phase 3 (Lighting), Phase 4 (Starfield), Phase 5 (PostFX).
 
-use crate::app::state::State;
+use crate::app::state::{QualityTier, State, ViewMode};
 use crate::export::{ExportFormat, ExportKind, ExportRequest};
 use crate::preset::{PresetAction, ShippedPreset};
 
@@ -37,6 +37,15 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State) {
         ui.separator();
         starfield_group(ui, state);
         ui.separator();
+        // Performance is native-only — the bench would freeze the tab for
+        // ~10 s and isn't useful in-browser. Export ships on both targets,
+        // but the wasm version is restricted to equirect PNG and triggers a
+        // browser download instead of using a native file dialog.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            performance_group(ui, state);
+            ui.separator();
+        }
         export_group(ui, state);
         ui.separator();
         ui.label(
@@ -81,45 +90,193 @@ fn preset_group(ui: &mut egui::Ui, state: &mut State) {
         });
 }
 
-fn export_group(ui: &mut egui::Ui, state: &mut State) {
-    egui::CollapsingHeader::new("Export")
+#[cfg(not(target_arch = "wasm32"))]
+fn performance_group(ui: &mut egui::Ui, state: &mut State) {
+    egui::CollapsingHeader::new("Performance")
         .default_open(false)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("width");
-                let labels: &[(u32, &str)] =
-                    &[(1024, "1K"), (2048, "2K"), (4096, "4K"), (8192, "8K")];
-                let current = labels
-                    .iter()
-                    .find(|(w, _)| *w == state.export_width)
-                    .map(|(_, l)| *l)
-                    .unwrap_or("custom");
-                egui::ComboBox::from_id_source("export_width")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (w, l) in labels {
-                            ui.selectable_value(&mut state.export_width, *w, *l);
-                        }
-                    });
-                ui.label(format!("→ {}×{}", state.export_width, state.export_width / 2));
-            });
             ui.label(
                 egui::RichText::new(
-                    "Equirect PNG (2:1). Cubemap and EXR land in Phase 6.5.",
+                    "Runs ~5 timed configs at varying resolution × march steps. \
+                     Uses your current lighting / starfield / scattering settings. \
+                     UI freezes for the duration.",
                 )
                 .italics()
                 .weak(),
             );
 
             ui.horizontal(|ui| {
-                let busy = state.pending_export.is_some();
+                let busy = state.bench_running || state.pending_bench;
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Export PNG…"))
+                    .add_enabled(!busy, egui::Button::new("Run benchmark"))
                     .clicked()
                 {
+                    state.pending_bench = true;
+                }
+                if busy {
+                    ui.spinner();
+                }
+            });
+
+            if !state.bench_results.is_empty() {
+                egui::Grid::new("bench_results_grid")
+                    .num_columns(4)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("config").strong());
+                        ui.label(egui::RichText::new("size").strong());
+                        ui.label(egui::RichText::new("ms").strong());
+                        ui.label(egui::RichText::new("fps").strong());
+                        ui.end_row();
+
+                        for r in &state.bench_results {
+                            ui.label(&r.label);
+                            ui.label(format!("{}×{}", r.width, r.height));
+                            ui.label(format!("{:.2}", r.ms_median));
+                            let fps = r.fps();
+                            let color = if fps >= 60.0 {
+                                egui::Color32::from_rgb(0x80, 0xff, 0x80)
+                            } else if fps >= 30.0 {
+                                egui::Color32::from_rgb(0xff, 0xc0, 0x60)
+                            } else {
+                                egui::Color32::from_rgb(0xff, 0x70, 0x70)
+                            };
+                            ui.colored_label(color, format!("{fps:.1}"));
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+}
+
+fn export_group(ui: &mut egui::Ui, state: &mut State) {
+    egui::CollapsingHeader::new("Export")
+        .default_open(false)
+        .show(ui, |ui| {
+            // Wasm restriction: equirect PNG only. Cubemap (6 downloads) and
+            // EXR (~10× file size) are deferred to a later phase; pin the
+            // state here so the user can't pick an invalid combination.
+            #[cfg(target_arch = "wasm32")]
+            {
+                state.export_kind = ExportKind::Equirect;
+                state.export_format = ExportFormat::Png;
+                ui.label(
+                    egui::RichText::new(
+                        "Equirect PNG → browser download. Cubemap and EXR are desktop-only.",
+                    )
+                    .weak(),
+                );
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.horizontal(|ui| {
+                    ui.label("kind");
+                    egui::ComboBox::from_id_salt("export_kind")
+                        .selected_text(state.export_kind.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.export_kind,
+                                ExportKind::Equirect,
+                                ExportKind::Equirect.label(),
+                            );
+                            ui.selectable_value(
+                                &mut state.export_kind,
+                                ExportKind::Cubemap,
+                                ExportKind::Cubemap.label(),
+                            );
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("format");
+                    egui::ComboBox::from_id_salt("export_format")
+                        .selected_text(state.export_format.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.export_format,
+                                ExportFormat::Png,
+                                ExportFormat::Png.label(),
+                            );
+                            // EXR currently only meaningful for equirect — cubemap
+                            // EXR is doable but defers to Phase 7.5; gate the
+                            // option to avoid silently producing invalid output.
+                            ui.add_enabled_ui(state.export_kind == ExportKind::Equirect, |ui| {
+                                ui.selectable_value(
+                                    &mut state.export_format,
+                                    ExportFormat::Exr,
+                                    ExportFormat::Exr.label(),
+                                );
+                            });
+                        });
+                });
+                // If the user switched to cubemap with EXR previously selected,
+                // bounce them back to PNG.
+                if state.export_kind == ExportKind::Cubemap
+                    && state.export_format == ExportFormat::Exr
+                {
+                    state.export_format = ExportFormat::Png;
+                }
+            }
+
+            ui.horizontal(|ui| {
+                // Wasm caps at 4K — 8K equirect at Export-tier step counts
+                // would freeze the tab for ~30 s and risk OOM during the
+                // tiled GPU readback.
+                #[cfg(target_arch = "wasm32")]
+                let labels: &[(u32, &str)] = &[(1024, "1K"), (2048, "2K"), (4096, "4K")];
+                #[cfg(not(target_arch = "wasm32"))]
+                let labels: &[(u32, &str)] = match state.export_kind {
+                    ExportKind::Equirect => &[(1024, "1K"), (2048, "2K"), (4096, "4K"), (8192, "8K")],
+                    // Cubemap face sizes — each face is square; 4K-per-face
+                    // = 24K total cubemap which is more than most pipelines
+                    // need.
+                    ExportKind::Cubemap => &[(512, "512"), (1024, "1K"), (2048, "2K"), (4096, "4K")],
+                };
+                #[cfg(target_arch = "wasm32")]
+                if state.export_width > 4096 {
+                    state.export_width = 2048;
+                }
+                ui.label(match state.export_kind {
+                    ExportKind::Equirect => "width",
+                    ExportKind::Cubemap => "face size",
+                });
+                let current = labels
+                    .iter()
+                    .find(|(w, _)| *w == state.export_width)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("custom");
+                egui::ComboBox::from_id_salt("export_width")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (w, l) in labels {
+                            ui.selectable_value(&mut state.export_width, *w, *l);
+                        }
+                    });
+                let dims = match state.export_kind {
+                    ExportKind::Equirect => format!("→ {}×{}", state.export_width, state.export_width / 2),
+                    ExportKind::Cubemap => {
+                        format!("→ 6 × {0}×{0}", state.export_width)
+                    }
+                };
+                ui.label(dims);
+            });
+
+            ui.horizontal(|ui| {
+                #[cfg(target_arch = "wasm32")]
+                let busy = state.pending_export.is_some()
+                    || state.pending_export_job.is_some();
+                #[cfg(not(target_arch = "wasm32"))]
+                let busy = state.pending_export.is_some();
+                let label = match (state.export_kind, state.export_format) {
+                    (ExportKind::Equirect, ExportFormat::Png) => "Export PNG…",
+                    (ExportKind::Equirect, ExportFormat::Exr) => "Export EXR…",
+                    (ExportKind::Cubemap, _) => "Export cube faces…",
+                };
+                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                     state.pending_export = Some(ExportRequest {
-                        format: ExportFormat::Png,
-                        kind: ExportKind::Equirect,
+                        format: state.export_format,
+                        kind: state.export_kind,
                         width: state.export_width,
                         path: None,
                     });
@@ -146,7 +303,7 @@ fn post_group(ui: &mut egui::Ui, state: &mut State) {
                 ui.label("curve");
                 let labels = ["AgX", "ACES Fitted", "Reinhard"];
                 let mut mode = p.tonemap_mode as usize;
-                egui::ComboBox::from_id_source("tonemap_mode")
+                egui::ComboBox::from_id_salt("tonemap_mode")
                     .selected_text(labels.get(mode).copied().unwrap_or("?"))
                     .show_ui(ui, |ui| {
                         for (i, l) in labels.iter().enumerate() {
@@ -278,8 +435,55 @@ fn frame_group(ui: &mut egui::Ui, state: &mut State) {
         .default_open(true)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.label("quality").on_hover_text(
+                    "Snap to a known-good performance/quality tier. \
+                     Individual sliders can still be tweaked afterward.",
+                );
+                for tier in [
+                    QualityTier::Draft,
+                    QualityTier::Preview,
+                    QualityTier::Quality,
+                    QualityTier::Export,
+                ] {
+                    if ui
+                        .button(tier.label())
+                        .on_hover_text(tier.tooltip())
+                        .clicked()
+                    {
+                        apply_quality(state, tier);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("view").on_hover_text(
+                    "Live-preview projection. Equirect shows the full 2:1 \
+                     skybox (with pole stretching at the top/bottom of the \
+                     canvas). Cube faces show a flat 90°-FOV pinhole view of \
+                     one direction — what your in-engine camera will see. \
+                     Export is unaffected.",
+                );
+                egui::ComboBox::from_id_salt("view_mode")
+                    .selected_text(state.view_mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            ViewMode::Equirect,
+                            ViewMode::PosX,
+                            ViewMode::NegX,
+                            ViewMode::PosY,
+                            ViewMode::NegY,
+                            ViewMode::PosZ,
+                            ViewMode::NegZ,
+                        ] {
+                            ui.selectable_value(&mut state.view_mode, m, m.label());
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
                 ui.label("preview scale");
                 ui.add(egui::Slider::new(&mut state.preview_scale, 0.25..=1.0).step_by(0.05));
+                if state.interacting {
+                    ui.label(egui::RichText::new("(auto ½)").weak());
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("seed");
@@ -288,7 +492,58 @@ fn frame_group(ui: &mut egui::Ui, state: &mut State) {
                     state.seed = state.seed.wrapping_mul(0x9E37_79B1).wrapping_add(1);
                 }
             });
+            #[cfg(target_arch = "wasm32")]
+            {
+                let label = if state.hero_shot {
+                    "Stop hero shot"
+                } else {
+                    "Render hero shot"
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(
+                        "Render the current composition once at Quality settings \
+                         (full resolution, 128 march steps, full bloom). The hero \
+                         frame is then frozen on the canvas so subsequent frames \
+                         cost almost nothing. Stays on until you move a slider.",
+                    )
+                    .clicked()
+                {
+                    state.hero_shot = !state.hero_shot;
+                    // Force a re-render at the new (or restored) settings.
+                    state.last_rendered_hash = None;
+                }
+            }
         });
+}
+
+fn apply_quality(state: &mut State, tier: QualityTier) {
+    match tier {
+        QualityTier::Draft => {
+            state.preview_scale = 0.5;
+            state.nebula.steps = 64;
+            state.lighting.shadow_steps = 4;
+            state.starfield.layers = 1;
+        }
+        QualityTier::Preview => {
+            state.preview_scale = 1.0;
+            state.nebula.steps = 96;
+            state.lighting.shadow_steps = 4;
+            state.starfield.layers = 3;
+        }
+        QualityTier::Quality => {
+            state.preview_scale = 1.0;
+            state.nebula.steps = 128;
+            state.lighting.shadow_steps = 6;
+            state.starfield.layers = 3;
+        }
+        QualityTier::Export => {
+            state.preview_scale = 1.0;
+            state.nebula.steps = 256;
+            state.lighting.shadow_steps = 8;
+            state.starfield.layers = 3;
+        }
+    }
 }
 
 fn nebula_group(ui: &mut egui::Ui, state: &mut State) {

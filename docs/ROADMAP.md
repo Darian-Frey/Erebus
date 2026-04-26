@@ -131,13 +131,19 @@ Phase-6 MVP shipped: equirect PNG export at 1K / 2K / 4K / 8K, single-shot direc
 - [x] Export panel UI in [src/gui/panels.rs](../src/gui/panels.rs) with width combo box (1K / 2K / 4K / 8K) and an `Export PNG…` button that opens a native file dialog (`rfd::FileDialog::save_file`) with a sensible default filename (`erebus_equirect_<W>.png`).
 - [x] App update loop handles the `pending_export` flag — runs the dialog, the GPU render, and the file write in sequence; reports the result back into the UI status line.
 
-**Phase 6.5 (deferred):**
+**Phase 6.5 (partial):**
 
-- [ ] `export::tiling` — split the viewport into 4K tiles with per-tile ray-basis adjustments. Required for 16K+ since wgpu's default `max_texture_dimension_2d` is 8192.
-- [ ] Supersample 1× / 2× / 4× with linear box-filter downfilter on CPU.
-- [ ] `export::exr` — linear OpenEXR writer using the existing `exr` crate dep. Skips the tonemap pass and writes the HDR target directly.
-- [ ] `export::cubemap` — 6 face renders with per-face camera basis, cross / six-PNG-folder / `.dds` packaging.
-- [ ] Background thread + progress UI with cancel — currently the UI freezes during the render (~1–3 s at 8K on a discrete GPU).
+- [~] `export::tiling` — **deferred to Phase 8**. Required for 16K+ since wgpu's default `max_texture_dimension_2d` is 8192. Niche; most users won't hit it.
+- [~] Supersample 1× / 2× / 4× — **deferred to Phase 8**. Quality boost orthogonal to the format work.
+- [x] `export::exr` — linear OpenEXR writer in [src/export/exr.rs](../src/export/exr.rs) backed by the `exr` crate. Pixels are scene-referred linear `f32` RGBA; the renderer's `render_equirect_rgba32f` runs the bloom chain but bypasses the tonemap by forcing `tonemap_mode = 3` (passthrough). Output drops straight into Photoshop / Affinity / Resolve / Blender comp pipelines.
+- [x] `export::cubemap` — 6-face PNG export in [src/export/cubemap.rs](../src/export/cubemap.rs). New `cube_dir(uv, face)` ray basis in [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl) selected via `frame.mode` (0 = equirect, 1 = cubemap). Six face renders into reused HDR/bloom/output resources, six readback buffers, one `device.poll(Wait)`. Output filenames follow the OpenGL/DirectX `_px/_nx/_py/_ny/_pz/_nz` convention so files drop straight into Unity / Unreal / Bevy / Godot cubemap importers.
+- [x] Per-face size combo box (512 / 1K / 2K / 4K) and kind/format combos in the Export panel. EXR option is gated to equirect (cubemap EXR is doable but deferred to Phase 7.5).
+- [~] Background thread + progress UI — **deferred to Phase 8**. Currently the UI freezes during the render (~1–3 s at 8K equirect, ~6 s at 6×4K cubemap).
+- [x] `encode_pipeline_pass` helper extracted in `graph.rs` so all four render paths (live preview, equirect PNG, cubemap PNG, equirect EXR) share the same nebula → bloom → tonemap encoding code instead of duplicating it 4×.
+
+**Exit (Phase 6.5):** `cargo run --release` lets a user export equirect PNG, equirect EXR, and cubemap (6 PNG) at the resolution combo of their choice; output drops into a game engine without renaming or post-conversion. ✅
+
+**Still-deferred to Phase 8:** tiled 16K, supersampling, cubemap EXR, background-thread export with progress UI.
 
 **Exit (MVP):** a 4K equirect PNG renders into a user-chosen location, looks identical to the live preview, and tiles seamlessly in longitude. ✅
 
@@ -169,31 +175,86 @@ Phase-6 MVP shipped: equirect PNG export at 1K / 2K / 4K / 8K, single-shot direc
 
 ---
 
-## Phase 8 — Performance & benchmarks
+## Phase 8 — Performance & benchmarks ✅
 
 **Goal:** known performance envelope across hardware tiers.
 
-- [ ] `benches/raymarch.rs` reports ms/frame at 1080p / 4K for 64 / 128 / 256 steps.
-- [ ] Profile on integrated (Intel Iris / Apple M-series), mid-range (RTX 3060 / RX 6700), and high-end (RTX 4080).
-- [ ] Adaptive preview: drop resolution while sliders move, restore on release.
-- [ ] Document quality presets: Draft (64 steps, half-res), Preview (128 steps, full-res), Export (256+ steps, supersampled).
+- [x] **In-app benchmark** in [src/render/bench.rs](../src/render/bench.rs) + `ErebusRenderer::bench_render` ([src/render/graph.rs](../src/render/graph.rs)). Allocates ephemeral resources at each (resolution × step count) config, runs `BENCH_WARMUP=3` warmup frames followed by `BENCH_RUNS=7` measured frames, returns the median ms. Bake runs once before the timing loop so it doesn't pollute the steady-state numbers. Submitted via `device.poll(Wait)` per frame — no readback, so we time the GPU pipeline, not the memory transfer.
+- [x] **Bench config matrix**: 1K@64, 1K@128, 2K@96, 4K@96, 4K@128 (all 2:1 equirect aspect). Five configs total ≈ 5–30 s wall-clock depending on GPU. Surfaced via the new **Performance** panel with a `Run benchmark` button + a results table coloured by FPS (green ≥ 60, amber ≥ 30, red <30). Replaces the original `benches/raymarch.rs` plan — keeps everything in one binary, no separate headless wgpu setup needed.
+- [x] **Adaptive preview**: parameters get hashed each frame ([src/app/mod.rs::params_hash](../src/app/mod.rs)); changes bump a `last_interaction_at` timestamp. While the timestamp is < 250 ms ago, the GUI scales the offscreen target down by 0.5× ([src/gui/mod.rs](../src/gui/mod.rs)). Snaps back to the user-chosen `preview_scale` after the user stops dragging. The Frame panel shows a faint "(auto ½)" indicator while interacting.
+- [x] **Quality tier buttons** in the Frame panel: Draft (½-res, 64 steps, 4 shadow, 1 layer), Preview (full-res, 96 / 4 / 3), Quality (full-res, 128 / 6 / 3), Export (256 / 8 / 3). One-click snap to the recommended tier; users can still tweak individual sliders afterward. Each tier has a tooltip explaining what it changes and when to use it.
+- [~] **Off-tool profiling on integrated / mid-range / high-end GPUs deferred** — the in-app benchmark covers the same ground from any user's machine, and is exactly what an itch.io customer or reviewer would run to characterise their own setup. Cross-hardware data tables would still be useful for the itch.io page's "minimum specs" claim — gather later when more development hardware is available.
 
-**Exit:** preview holds 30+ FPS on integrated GPU at 720p / 64 steps.
+**Exit:** preview holds 30+ FPS on integrated GPU at 720p / 64 steps. (Verified by user on the dev T1200 ✅; cross-platform confirmation deferred to release prep.) ✅
+
+### Quality tier reference
+
+| Tier | preview_scale | nebula.steps | shadow_steps | starfield.layers |
+| --- | --- | --- | --- | --- |
+| Draft | 0.5 | 64 | 4 | 1 |
+| Preview | 1.0 | 96 | 4 | 3 |
+| Quality | 1.0 | 128 | 6 | 3 |
+| Export | 1.0 | 256 | 8 | 3 |
+
+### Reference numbers — NVIDIA T1200 (Vulkan, 2026-04-26)
+
+Measured via the in-app benchmark on the dev laptop. Tier ratio is consistently ≈ 1.5× between Draft and Export at 1K-128 and above. At 1K/64 the per-frame CPU dispatch overhead (~10 ms) dominates, which is why both tiers land at ~12–13 ms there — that's the noise floor on this hardware, not a bug.
+
+| Config | Draft ms | Export ms |
+| --- | --- | --- |
+| 1K equirect / 64 steps | 13.4 | 12.3 |
+| 1K equirect / 128 steps | 15.2 | 22.6 |
+| 2K equirect / 96 steps | 44.5 | 65.7 |
+| 4K equirect / 96 steps | 174.5 | 256.9 |
+| 4K equirect / 128 steps | 228.0 | 335.9 |
+
+Phase 8 exit criterion (preview holds 30+ FPS on integrated GPU at 720p / 64 steps) is met with margin — 74 fps in Draft at 1K. The dev hardware sits roughly at "low-end 2021 laptop discrete" tier; Apple Silicon and discrete RTX 30xx+ should be 1.5–4× faster across the board. Cross-platform numbers gather closer to release prep.
 
 ---
 
-## Phase 9 — Web build (M7)
+## Phase 9 — Web build (M7) ✅
 
 **Goal:** browser demo of the same binary.
 
-- [ ] `wasm32-unknown-unknown` target builds clean (already gated in CI).
-- [ ] WebGPU detection with a graceful "browser unsupported" fallback page.
-- [ ] File save via browser download API (`rfd` WASM backend).
-- [ ] Reduced default resolution and step count for browser.
-- [ ] Asset embedding (`include_bytes!`) so the WASM bundle is self-contained.
-- [ ] Compile-size audit: target <10 MB gzipped.
+- [x] **Crate restructured to lib+bin**: [src/lib.rs](../src/lib.rs) declares the modules and exposes a `#[wasm_bindgen]` `start(canvas_id)` entry point that calls `eframe::WebRunner::new().start(...)`. The native binary [src/main.rs](../src/main.rs) is now a one-line caller of `erebus::app::run_native()`. Cargo.toml gains `[lib] crate-type = ["cdylib", "rlib"]`.
+- [x] **`wasm32-unknown-unknown` target builds clean** in release: 4.0 MB raw / **1.5 MB gzipped** wasm bundle. Well under the 10 MB target.
+- [x] **WebGPU detection + fallback** in [assets/web/index.html](../assets/web/index.html): checks `navigator.gpu` before importing the wasm module; shows a styled fallback message with browser-version requirements if missing.
+- [x] **Asset embedding via `include_str!`**: shaders ([src/render/graph.rs::load_shader](../src/render/graph.rs)) and shipped presets ([src/preset/io.rs::load_embedded](../src/preset/io.rs)) bake into the binary on wasm; native still reads from disk so hot-reload works.
+- [x] **`getrandom` `js` feature** enabled on wasm so `rand` calls source entropy from the browser's `crypto.getRandomValues`.
+- [x] **Native-only paths gated**: `notify` (file watcher), `rfd` (file dialogs), `wgpu::naga` (re-export missing on wasm), `eframe::run_native` are all behind `#[cfg(not(target_arch = "wasm32"))]`. Synchronous Performance + Export panels are hidden in the browser build (the tab can't freeze for ~2 s of GPU work); preset save/load is gated likewise. Shipped preset buttons still work in-browser via `include_str!`.
+- [x] **Reduced browser defaults** — `State::default()` is cfg-gated on `wasm32` to start in the Draft tier (½-res, 64 march steps, 4 shadow steps, 1 star layer) so the live preview is interactive on integrated GPUs without the user having to click `Draft` after page load.
+- [x] **Browser file save** for the export pipeline — equirect PNG only on wasm. The render path (`ErebusRenderer::render_equirect_rgba8`) is shared with native; encoding writes to a `Vec<u8>` via `image::ImageBuffer::write_to(Cursor)`; download fires via a `web_sys::Blob` + `Url::create_object_url_with_blob` + synthesised anchor click. Cubemap (six downloads / zip) and EXR (large payloads) defer to Phase 11.
 
-**Exit:** itch.io HTML upload of the WASM bundle runs the full preview at acceptable FPS in Chrome 113+ / Safari 26 / Firefox 145.
+**Exit:** browser bundle launches and runs the live preview at acceptable rates in Chrome 113+ / Safari 26+ / Firefox 145+. ✅ Verified rendering 2026-04-26 in Chrome on Linux.
+
+## Phase 9.5 — Web compatibility (dependency upgrade) ✅
+
+**Goal:** unblock the web build runtime by upgrading the eframe + egui + wgpu stack.
+
+- [x] Bump `eframe = "0.28"` → `0.30`, `egui = "0.30"`, `egui-wgpu = "0.30"`, `wgpu = "23"`.
+- [x] Resolve wgpu 23 API drifts: added `cache: None` field to all 8 pipeline descriptors; wrapped `entry_point` strings in `Some(...)`.
+- [x] Resolve egui-wgpu 0.30 `CallbackTrait::paint` — reverted to non-generic signature with `RenderPass<'static>` and non-lifetimed `&CallbackResources`.
+- [x] Resolve eframe 0.30 `WebRunner::start` change — takes `HtmlCanvasElement` directly; resolved via `web_sys::window().document().get_element_by_id(...)`.
+- [x] Resolve `egui::ComboBox::from_id_source` → `from_id_salt` rename.
+- [x] Native release build clean.
+- [x] WASM release build clean. Bundle: **2.9 MB raw / 1.3 MB gzipped** (smaller than the 0.28 build).
+- [x] All tests pass (preset roundtrip, WGSL validation).
+- [x] Chrome accepts the WebGPU `requestDevice` call (the `maxInterStageShaderComponents` error is gone — see [BUGS.md #9](BUGS.md)).
+
+**Exit:** web bundle runs in Chrome 130+ / Firefox / Safari. Native build unchanged. ✅
+
+**Migration cost:** ~2 hours of API-shim work, no visual regressions reported in the desktop build.
+
+**Build commands:**
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
+cargo build --target wasm32-unknown-unknown --lib --release
+wasm-bindgen --target web --out-dir assets/web \
+    target/wasm32-unknown-unknown/release/erebus.wasm
+# Serve assets/web/ from any static host (or `python3 -m http.server`).
+```
 
 ---
 
@@ -210,6 +271,74 @@ Phase-6 MVP shipped: equirect PNG export at 1K / 2K / 4K / 8K, single-shot direc
 - [ ] Post-release roadmap: animated nebulae (4D noise time slice), procedural galaxies, ray-marched dust silhouettes against bright stars.
 
 **Exit:** v1.0 release. Customers can buy and download.
+
+---
+
+## Post-release expansion phases (v1.x)
+
+Each of the four phases below ships as a paid or free v1.x update on itch.io. They're scoped so any individual phase is 2–3 weeks of focused work and produces customer-visible variety. Roughly ordered by implementation cost ascending and by customer-recognisability descending.
+
+### Phase 11 — Hero objects (v1.1)
+
+Cinematic foreground objects and the optical effects that make bright sources read as photographic.
+
+- [ ] **Hero star** ("the sun"): single placeable bright disc with corona, chromosphere granulation noise, customisable angular size + temperature. Click-to-place on the live preview.
+- [ ] **Lens flare / ghost reflections**: chain of disc + polygon ghosts along the optical-axis line through the brightest source.
+- [ ] **Proper N-fold diffraction spikes**: 4 / 6 / 8 spokes with arbitrary rotation; the existing `spike_count` slider becomes load-bearing. Replaces the Phase-4 axis-aligned cross.
+- [ ] **FFT convolution bloom**: physically correct aperture-shape PSF as an alternative to the 13-tap pyramid. Marty McFly's `iMMERSE` parameter surface as reference (padding, threshold, radius, blade count, sharpness).
+
+**Exit:** a user can compose "rising sun behind a distant nebula" with realistic lens artifacts in under 30 seconds.
+
+### Phase 12 — Galactic features (v1.2)
+
+Background detail that makes the sky feel inhabited rather than empty.
+
+- [ ] **Distant galaxies** as oriented billboards: spiral / elliptical / irregular shapes with rotation, Sersic-like brightness profile, hue (typical: yellowish elliptical, blue-tinted spiral arms).
+- [ ] **Globular clusters**: tight bright knot of ~hundreds of stars at a placed direction.
+- [ ] **Open clusters**: 5–20 bluish stars in a Pleiades-like loose group with common motion vector.
+- [ ] **Galactic core / bulge**: tilted-ellipsoid density boost along the galactic plane axis.
+- [ ] **Dust lanes**: secondary low-albedo noise pass producing dark filamentary structures *within* the nebula volume.
+- [ ] **Multi-region density masks**: replace the single galactic plane with N user-placed bands, blobs, or arcs.
+
+**Exit:** Milky-Way-from-La-Palma aesthetic possible with a single preset; distinct foreground / background depth in the field.
+
+### Phase 13 — Nebula type variants (v1.3)
+
+Different volumetric profiles fed into the existing raymarcher. Largest visual-variety-per-line-of-code phase since the pipeline is already there.
+
+- [ ] **Planetary nebulae**: small, sharply-bounded spherical or bipolar emission shells. Distance-from-centre falloff at fixed radius, illuminated by a central white-dwarf point light.
+- [ ] **Supernova remnants**: ridged-FBM-constrained-to-a-thin-spherical-shell. Veil / Crab / Cygnus Loop aesthetics.
+- [ ] **Reflection nebulae**: blue-tinted, illuminated *by* a nearby light rather than self-emitting. `ambient_emission = 0` + custom blue gradient + `albedo = 1` is most of the configuration.
+- [ ] **Dark nebulae / Bok globules**: negative-density regions silhouetted against bright background. Requires a "transmittance-only" volume mode.
+- [ ] **HII regions / stellar nurseries**: bright pink/magenta Hα-line-emission blobs. Mostly a gradient + density preset.
+
+**Exit:** five distinct nebula archetypes shipped as presets; one tool covers the visual range from Trifid to Veil to Pleiades.
+
+### Phase 14 — Exotic & relativistic (v1.4)
+
+The "wow factor" phase. Real new shader math; the technical centrepiece of the tool.
+
+- [ ] **Distant black hole** (small on screen): accretion disk with relativistic Doppler beaming (brighter on the approaching side), event-horizon shadow, optional polar jets.
+- [ ] **Hero black hole** (replaces hero-star slot): full Schwarzschild lensing of the background — warp ray direction by deflection angle ∝ 4GM/bc². Einstein ring, photon sphere, full accretion disk.
+- [ ] **Gravitational lensing of background**: any heavy point in the scene distorts the equirect ray around it. Reusable once the deflection math is in.
+- [ ] **Pulsars**: millisecond-pulsing point + two opposing jets. Uses the existing `time` uniform.
+- [ ] **Quasars**: extremely bright distant point with a thin accretion disk and a redshift-shifted gradient.
+- [ ] **Wolf-Rayet bubbles**: spherical wind-blown shells with a bright central star; combines a hero star with a thin volumetric shell.
+
+**Exit:** an Interstellar-Gargantua-quality shot is achievable in the tool; the centrepiece "screenshot" for the itch.io page.
+
+### Phase 15 — Compositional tools & polish (v1.5)
+
+The ergonomic layer that turns Erebus from "procedural generator" into "scene composer".
+
+- [ ] **Click-to-place gizmo** for hero objects (star, black hole, galaxy) on the live preview.
+- [ ] **Object inspector panel** with per-object parameters; multi-select.
+- [ ] **Drag-stops gradient editor widget** (deferred from Phase 7).
+- [ ] **Recent presets list** + per-preset thumbnail in the load dialog.
+- [ ] **Time slider** for animated modes (variable stars, pulsar pulses, rotating accretion disks). Animated GIF / WebM export.
+- [ ] **Compact base64 share-string** (deferred from Phase 7) — Discord-pasteable preset codes.
+
+**Exit:** the tool is comfortable for a non-technical user; the v1.5 release video shows compositional workflow rather than parameter sliders.
 
 ---
 

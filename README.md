@@ -30,12 +30,26 @@ cargo run --release
 
 Native debug builds enable `opt-level = 1` for the workspace and `opt-level = 3` for dependencies, which keeps shader iteration responsive without hour-long initial compiles.
 
-### Web build (planned)
+### Web build (WebGPU / WASM)
+
+Phase 9 lands a browser build using the same Rust + WGSL source as the native binary. Output: a 4 MB raw / **1.5 MB gzipped** wasm bundle plus a JS glue file. Shippable.
 
 ```bash
-cargo build --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --out-dir dist target/wasm32-unknown-unknown/release/erebus.wasm
+# One-time tooling install:
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.95   # match the version in Cargo.lock
+
+# Build:
+cargo build --target wasm32-unknown-unknown --lib --release
+wasm-bindgen --target web --out-dir assets/web \
+    target/wasm32-unknown-unknown/release/erebus.wasm
+
+# Serve (any static file server works; Python's is fine for local testing):
+cd assets/web && python3 -m http.server 8000
+# Visit http://localhost:8000
 ```
+
+WebGPU support: Chrome 113+, Edge 113+, Safari 26+ (macOS), Firefox 145+. The page detects `navigator.gpu` and shows a fallback message if unavailable. Performance / Export / Save preset panels are hidden in the browser build (rfd file dialogs and synchronous bench/export would freeze the tab); use the desktop binary for those.
 
 ## Repository layout
 

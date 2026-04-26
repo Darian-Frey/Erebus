@@ -17,6 +17,10 @@ fn zero_pad2() -> [f32; 2] {
     [0.0; 2]
 }
 
+/// Render-projection mode. Selected per-pass via `FrameUniforms::mode`.
+pub const RENDER_MODE_EQUIRECT: u32 = 0;
+pub const RENDER_MODE_CUBEMAP: u32 = 1;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FrameUniforms {
@@ -25,8 +29,11 @@ pub struct FrameUniforms {
     pub exposure: f32,
     pub seed: u32,
     pub frame_index: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    /// 0 = equirect, 1 = cubemap. Set by the export path; live preview is
+    /// always equirect.
+    pub mode: u32,
+    /// 0..6 cube-face index when `mode == 1`. Order: +X, -X, +Y, -Y, +Z, -Z.
+    pub cube_face: u32,
 }
 
 impl Default for FrameUniforms {
@@ -37,8 +44,8 @@ impl Default for FrameUniforms {
             exposure: 0.0,
             seed: 0,
             frame_index: 0,
-            _pad0: 0,
-            _pad1: 0,
+            mode: RENDER_MODE_EQUIRECT,
+            cube_face: 0,
         }
     }
 }

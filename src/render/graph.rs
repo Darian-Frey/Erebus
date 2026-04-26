@@ -10,12 +10,13 @@
 //   5. Tonemap pass: read HDR + bloom.mip[0], apply exposure, grade, AgX/ACES/
 //      Reinhard tonemap, triangular dither → swapchain.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytemuck::bytes_of;
+use web_time::Instant;
 
 use crate::app::config::HDR_FORMAT;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::render::context::shader_root;
 use crate::render::hot_reload::ShaderWatcher;
 use crate::render::resources::samplers::linear_clamp;
@@ -24,7 +25,7 @@ use crate::render::resources::textures::{
 };
 use crate::render::uniforms::{
     BakeUniforms, FrameUniforms, LightingUniforms, NebulaUniforms, PostUniforms,
-    StarfieldUniforms,
+    StarfieldUniforms, RENDER_MODE_CUBEMAP,
 };
 
 pub struct ErebusRenderer {
@@ -81,6 +82,11 @@ pub struct ErebusRenderer {
     // exported texture can be read back directly as sRGB-encoded PNG bytes
     // without per-pixel format swizzling.
     export_tonemap_pipeline: wgpu::RenderPipeline,
+
+    // Phase 6.5: linear HDR pipeline targeting Rgba16Float, used by EXR
+    // export. Same composite shader, but `tonemap_mode` is forced to 3
+    // (passthrough) at dispatch time so on-disk values stay scene-referred.
+    export_linear_pipeline: wgpu::RenderPipeline,
 
     watcher: ShaderWatcher,
     pub last_shader_error: Option<String>,
@@ -183,7 +189,12 @@ impl ErebusRenderer {
             &post_buffer,
         );
 
+        // ShaderWatcher takes a path so the API stays uniform; the WASM
+        // stub ignores it and `shader_root()` is only defined on native.
+        #[cfg(not(target_arch = "wasm32"))]
         let watcher = ShaderWatcher::new(shader_root())?;
+        #[cfg(target_arch = "wasm32")]
+        let watcher = ShaderWatcher::new(std::path::PathBuf::new())?;
 
         Ok(Self {
             device,
@@ -221,14 +232,17 @@ impl ErebusRenderer {
             tonemap_bg,
             tonemap_pipeline: pipelines.tonemap,
             export_tonemap_pipeline: pipelines.export_tonemap,
+            export_linear_pipeline: pipelines.export_linear,
             watcher,
             last_shader_error: None,
         })
     }
 
-    pub fn poll_hot_reload(&mut self) {
+    /// Returns true if a rebuild fired (regardless of success). Callers use
+    /// the bool to invalidate any frame caches keyed on shader output.
+    pub fn poll_hot_reload(&mut self) -> bool {
         if !self.watcher.poll() {
-            return;
+            return false;
         }
         log::info!("shaders dirty — rebuilding pipelines");
         match build_pipelines(
@@ -247,6 +261,7 @@ impl ErebusRenderer {
                 self.bloom_upsample_pipeline = p.bloom_upsample;
                 self.tonemap_pipeline = p.tonemap;
                 self.export_tonemap_pipeline = p.export_tonemap;
+                self.export_linear_pipeline = p.export_linear;
                 self.last_bake = None;
                 self.last_shader_error = None;
                 log::info!("shader rebuild OK");
@@ -256,6 +271,7 @@ impl ErebusRenderer {
                 self.last_shader_error = Some(format!("{e}"));
             }
         }
+        true
     }
 
     /// Resize HDR target + bloom pyramid + per-mip bind groups when the
@@ -364,7 +380,14 @@ impl ErebusRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        // 3. Bloom downsample chain.
+        // 3. Bloom downsample chain. Skipped when the user has dialed bloom
+        // off — each pass costs ~40 ms of per-pass overhead in browser WebGPU
+        // on integrated GPUs, so 9 bloom passes can dominate the frame budget
+        // when their visual contribution is zero anyway. The composite pass
+        // multiplies by `bloom_intensity` so the stale mip data is harmless.
+        if post.bloom_intensity <= 1.0e-4 {
+            return;
+        }
         let mip_count = self.bloom.mip_count() as usize;
         for i in 0..mip_count {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -420,7 +443,7 @@ impl ErebusRenderer {
     }
 
     /// Final tonemap pass into the egui-owned render pass.
-    pub fn composite<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub fn composite(&self, pass: &mut wgpu::RenderPass<'static>) {
         pass.set_pipeline(&self.tonemap_pipeline);
         pass.set_bind_group(0, &self.tonemap_bg, &[]);
         pass.draw(0..3, 0..1);
@@ -664,18 +687,25 @@ impl ErebusRenderer {
             },
         );
 
+        log::info!("export: queue.submit");
         queue.submit(Some(encoder.finish()));
+        log::info!("export: queue.submit returned");
 
         // Map + block until the GPU has finished writing.
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), wgpu::BufferAsyncError>>(1);
+        log::info!("export: map_async issued");
         slice.map_async(wgpu::MapMode::Read, move |res| {
+            log::info!("export: map_async callback fired");
             let _ = tx.send(res);
         });
+        log::info!("export: device.poll(Wait) entering");
         self.device.poll(wgpu::Maintain::Wait);
+        log::info!("export: device.poll returned, rx.recv entering");
         rx.recv()
             .map_err(|e| anyhow::anyhow!("readback channel: {e}"))?
             .map_err(|e| anyhow::anyhow!("buffer map: {e:?}"))?;
+        log::info!("export: rx.recv returned");
 
         // Strip per-row padding into a tightly packed RGBA buffer.
         let mapped = slice.get_mapped_range();
@@ -687,8 +717,965 @@ impl ErebusRenderer {
         }
         drop(mapped);
         readback.unmap();
+        log::info!("export: unmap done, returning {} bytes", out.len());
 
         Ok(out)
+    }
+
+    /// Render six cube faces (+X, -X, +Y, -Y, +Z, -Z) at `face_size`²
+    /// resolution and return their tonemapped sRGB RGBA8 pixels. Each face
+    /// uses its own readback buffer; one `device.poll(Wait)` at the end
+    /// blocks until all six have finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_cubemap_rgba8(
+        &mut self,
+        queue: &wgpu::Queue,
+        face_size: u32,
+        frame: FrameUniforms,
+        nebula: NebulaUniforms,
+        lighting: LightingUniforms,
+        starfield: StarfieldUniforms,
+        post: PostUniforms,
+    ) -> anyhow::Result<[Vec<u8>; 6]> {
+        anyhow::ensure!(face_size > 0, "face size must be non-zero");
+        let size = (face_size, face_size);
+
+        let export_hdr = HdrTarget::new(&self.device, size);
+        let export_bloom = BloomPyramid::new(&self.device, size);
+
+        let export_output = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("erebus.export.cubemap.output"),
+            size: wgpu::Extent3d {
+                width: face_size,
+                height: face_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: EXPORT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let export_output_view =
+            export_output.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let unpadded_row_bytes = face_size * 4;
+        let row_align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row_bytes = unpadded_row_bytes.div_ceil(row_align) * row_align;
+        let buffer_size = (padded_row_bytes as u64) * (face_size as u64);
+
+        let readbacks: Vec<wgpu::Buffer> = (0..6)
+            .map(|i| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("erebus.export.cubemap.readback.{i}")),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+
+        let bloom_downsample_bgs = build_bloom_downsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_hdr.view,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let bloom_upsample_bgs = build_bloom_upsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let tonemap_bg = create_tonemap_bg(
+            &self.device,
+            &self.tonemap_bgl,
+            &export_hdr.view,
+            &export_bloom.mips[0],
+            &self.sampler,
+            &self.post_buffer,
+        );
+
+        // Static uniforms — same across all six faces.
+        let mut p = post;
+        p.resolution = [face_size as f32, face_size as f32];
+        queue.write_buffer(&self.nebula_buffer, 0, bytes_of(&nebula));
+        queue.write_buffer(&self.lighting_buffer, 0, bytes_of(&lighting));
+        queue.write_buffer(&self.starfield_buffer, 0, bytes_of(&starfield));
+        queue.write_buffer(&self.post_buffer, 0, bytes_of(&p));
+
+        // Bake check — runs at most once even though we'll render six times.
+        let want_bake = BakeUniforms {
+            seed: frame.seed,
+            octaves: nebula.octaves_density,
+            lacunarity: nebula.lacunarity,
+            gain: nebula.gain,
+        };
+        let needs_bake = match self.last_bake {
+            None => true,
+            Some(prev) => prev.differs(&want_bake),
+        };
+        if needs_bake {
+            queue.write_buffer(&self.bake_buffer, 0, bytes_of(&want_bake));
+        }
+
+        for face in 0..6u32 {
+            let mut f = frame;
+            f.resolution = [face_size as f32, face_size as f32];
+            f.mode = RENDER_MODE_CUBEMAP;
+            f.cube_face = face;
+            queue.write_buffer(&self.frame_buffer, 0, bytes_of(&f));
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(&format!("erebus.export.cubemap.face{face}")),
+                });
+
+            // Bake on the first face only; subsequent faces reuse the volume.
+            if face == 0 && needs_bake {
+                let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("erebus.export.cubemap.bake"),
+                    timestamp_writes: None,
+                });
+                compute.set_pipeline(&self.bake_pipeline);
+                compute.set_bind_group(0, &self.bake_bg, &[]);
+                compute.dispatch_workgroups(32, 32, 32);
+                drop(compute);
+                self.last_bake = Some(want_bake);
+            }
+
+            encode_pipeline_pass(
+                &mut encoder,
+                &self.nebula_pipeline,
+                &self.nebula_bg,
+                &self.bloom_downsample_first_pipeline,
+                &self.bloom_downsample_pipeline,
+                &self.bloom_upsample_pipeline,
+                &self.export_tonemap_pipeline,
+                &tonemap_bg,
+                &export_hdr,
+                &export_bloom,
+                &export_output_view,
+                &bloom_downsample_bgs,
+                &bloom_upsample_bgs,
+            );
+
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &export_output,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &readbacks[face as usize],
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(face_size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: face_size,
+                    height: face_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            queue.submit(Some(encoder.finish()));
+        }
+
+        // Map all six readbacks; one Wait covers them all.
+        for (i, rb) in readbacks.iter().enumerate() {
+            let slice = rb.slice(..);
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                if let Err(e) = res {
+                    log::error!("cube face {i} map failed: {e:?}");
+                }
+            });
+        }
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Strip per-row padding into tightly packed RGBA buffers.
+        let mut faces: [Vec<u8>; 6] = Default::default();
+        for (i, rb) in readbacks.iter().enumerate() {
+            let mapped = rb.slice(..).get_mapped_range();
+            let mut out = Vec::with_capacity((unpadded_row_bytes as usize) * (face_size as usize));
+            for row in 0..face_size {
+                let row_start = (row as usize) * (padded_row_bytes as usize);
+                let row_end = row_start + (unpadded_row_bytes as usize);
+                out.extend_from_slice(&mapped[row_start..row_end]);
+            }
+            drop(mapped);
+            rb.unmap();
+            faces[i] = out;
+        }
+
+        Ok(faces)
+    }
+
+    /// Render an equirect at `(width, height)` and return raw linear-space
+    /// `f32` RGBA pixels — bypasses the display-tonemap by forcing
+    /// `tonemap_mode = 3` so the on-disk EXR contains scene-referred radiance.
+    /// Bloom is still applied (so the EXR matches the look you'd see in
+    /// preview if you cranked exposure into the same range).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_equirect_rgba32f(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        frame: FrameUniforms,
+        nebula: NebulaUniforms,
+        lighting: LightingUniforms,
+        starfield: StarfieldUniforms,
+        post: PostUniforms,
+    ) -> anyhow::Result<Vec<f32>> {
+        anyhow::ensure!(width > 0 && height > 0, "export size must be non-zero");
+        let size = (width, height);
+
+        let export_hdr = HdrTarget::new(&self.device, size);
+        let export_bloom = BloomPyramid::new(&self.device, size);
+
+        let export_output = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("erebus.export.linear.output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: EXPORT_LINEAR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let export_output_view =
+            export_output.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // RGBA16F = 8 bytes per pixel.
+        let unpadded_row_bytes = width * 8;
+        let row_align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row_bytes = unpadded_row_bytes.div_ceil(row_align) * row_align;
+        let buffer_size = (padded_row_bytes as u64) * (height as u64);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("erebus.export.linear.readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bloom_downsample_bgs = build_bloom_downsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_hdr.view,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let bloom_upsample_bgs = build_bloom_upsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let tonemap_bg = create_tonemap_bg(
+            &self.device,
+            &self.tonemap_bgl,
+            &export_hdr.view,
+            &export_bloom.mips[0],
+            &self.sampler,
+            &self.post_buffer,
+        );
+
+        // Force linear passthrough + disable deband; everything else stays
+        // user-controlled.
+        let mut p = post;
+        p.resolution = [width as f32, height as f32];
+        p.tonemap_mode = 3;
+        p.deband_amount = 0.0;
+
+        let mut f = frame;
+        f.resolution = [width as f32, height as f32];
+
+        queue.write_buffer(&self.frame_buffer, 0, bytes_of(&f));
+        queue.write_buffer(&self.nebula_buffer, 0, bytes_of(&nebula));
+        queue.write_buffer(&self.lighting_buffer, 0, bytes_of(&lighting));
+        queue.write_buffer(&self.starfield_buffer, 0, bytes_of(&starfield));
+        queue.write_buffer(&self.post_buffer, 0, bytes_of(&p));
+
+        let want_bake = BakeUniforms {
+            seed: frame.seed,
+            octaves: nebula.octaves_density,
+            lacunarity: nebula.lacunarity,
+            gain: nebula.gain,
+        };
+        let needs_bake = match self.last_bake {
+            None => true,
+            Some(prev) => prev.differs(&want_bake),
+        };
+        if needs_bake {
+            queue.write_buffer(&self.bake_buffer, 0, bytes_of(&want_bake));
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("erebus.export.linear.encoder"),
+            });
+        if needs_bake {
+            let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("erebus.export.linear.bake"),
+                timestamp_writes: None,
+            });
+            compute.set_pipeline(&self.bake_pipeline);
+            compute.set_bind_group(0, &self.bake_bg, &[]);
+            compute.dispatch_workgroups(32, 32, 32);
+            drop(compute);
+            self.last_bake = Some(want_bake);
+        }
+
+        encode_pipeline_pass(
+            &mut encoder,
+            &self.nebula_pipeline,
+            &self.nebula_bg,
+            &self.bloom_downsample_first_pipeline,
+            &self.bloom_downsample_pipeline,
+            &self.bloom_upsample_pipeline,
+            &self.export_linear_pipeline,
+            &tonemap_bg,
+            &export_hdr,
+            &export_bloom,
+            &export_output_view,
+            &bloom_downsample_bgs,
+            &bloom_upsample_bgs,
+        );
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &export_output,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), wgpu::BufferAsyncError>>(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| anyhow::anyhow!("readback channel: {e}"))?
+            .map_err(|e| anyhow::anyhow!("buffer map: {e:?}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for row in 0..height {
+            let row_start = (row as usize) * (padded_row_bytes as usize);
+            let row_end = row_start + (unpadded_row_bytes as usize);
+            let row_bytes = &mapped[row_start..row_end];
+            // 4 channels × 2 bytes each, little-endian f16.
+            for px in row_bytes.chunks_exact(8) {
+                for half in px.chunks_exact(2) {
+                    let bits = u16::from_le_bytes([half[0], half[1]]);
+                    out.push(f16_bits_to_f32(bits));
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+
+        Ok(out)
+    }
+
+    /// Run the full nebula → bloom → tonemap pipeline `warmup + runs` times
+    /// at the supplied resolution, return the **median** wall-clock ms over
+    /// the measured frames. No readback — we only time the GPU pipeline,
+    /// not the CPU↔GPU memory transfer.
+    ///
+    /// `nebula.steps` is the dominant cost driver; pass different values per
+    /// call to characterise the step-count ↔ ms-frame curve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_render(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        warmup: u32,
+        runs: u32,
+        frame: FrameUniforms,
+        nebula: NebulaUniforms,
+        lighting: LightingUniforms,
+        starfield: StarfieldUniforms,
+        post: PostUniforms,
+    ) -> anyhow::Result<f32> {
+        anyhow::ensure!(width > 0 && height > 0 && runs > 0, "invalid bench size");
+
+        let bench_hdr = HdrTarget::new(&self.device, (width, height));
+        let bench_bloom = BloomPyramid::new(&self.device, (width, height));
+        let bench_output = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("erebus.bench.output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: EXPORT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let bench_output_view =
+            bench_output.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bloom_downsample_bgs = build_bloom_downsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &bench_hdr.view,
+            &bench_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let bloom_upsample_bgs = build_bloom_upsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &bench_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let tonemap_bg = create_tonemap_bg(
+            &self.device,
+            &self.tonemap_bgl,
+            &bench_hdr.view,
+            &bench_bloom.mips[0],
+            &self.sampler,
+            &self.post_buffer,
+        );
+
+        let mut f = frame;
+        f.resolution = [width as f32, height as f32];
+        let mut p = post;
+        p.resolution = [width as f32, height as f32];
+        queue.write_buffer(&self.frame_buffer, 0, bytes_of(&f));
+        queue.write_buffer(&self.nebula_buffer, 0, bytes_of(&nebula));
+        queue.write_buffer(&self.lighting_buffer, 0, bytes_of(&lighting));
+        queue.write_buffer(&self.starfield_buffer, 0, bytes_of(&starfield));
+        queue.write_buffer(&self.post_buffer, 0, bytes_of(&p));
+
+        // Bake once before we start timing so warmup frames don't pay the
+        // bake cost (which isn't representative of the per-frame steady state).
+        let want_bake = BakeUniforms {
+            seed: frame.seed,
+            octaves: nebula.octaves_density,
+            lacunarity: nebula.lacunarity,
+            gain: nebula.gain,
+        };
+        let needs_bake = match self.last_bake {
+            None => true,
+            Some(prev) => prev.differs(&want_bake),
+        };
+        if needs_bake {
+            queue.write_buffer(&self.bake_buffer, 0, bytes_of(&want_bake));
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("erebus.bench.bake"),
+                });
+            {
+                let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("erebus.bench.bake_3d_noise"),
+                    timestamp_writes: None,
+                });
+                compute.set_pipeline(&self.bake_pipeline);
+                compute.set_bind_group(0, &self.bake_bg, &[]);
+                compute.dispatch_workgroups(32, 32, 32);
+            }
+            queue.submit(Some(encoder.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+            self.last_bake = Some(want_bake);
+        }
+
+        let run_one = |label: &'static str| -> f32 {
+            let started = Instant::now();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+            encode_pipeline_pass(
+                &mut encoder,
+                &self.nebula_pipeline,
+                &self.nebula_bg,
+                &self.bloom_downsample_first_pipeline,
+                &self.bloom_downsample_pipeline,
+                &self.bloom_upsample_pipeline,
+                &self.export_tonemap_pipeline,
+                &tonemap_bg,
+                &bench_hdr,
+                &bench_bloom,
+                &bench_output_view,
+                &bloom_downsample_bgs,
+                &bloom_upsample_bgs,
+            );
+            queue.submit(Some(encoder.finish()));
+            self.device.poll(wgpu::Maintain::Wait);
+            started.elapsed().as_secs_f64() as f32 * 1000.0
+        };
+
+        for _ in 0..warmup {
+            let _ = run_one("erebus.bench.warmup");
+        }
+        let mut samples: Vec<f32> = (0..runs).map(|_| run_one("erebus.bench.measure")).collect();
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(samples[samples.len() / 2])
+    }
+}
+
+// -------- Wasm-only async export --------------------------------------------
+//
+// Browsers can't run a synchronous `device.poll(Wait)` — the readback callback
+// fires through the JS event loop, which is blocked while we're inside
+// `update()`. So the export is split across multiple frames: frame N submits
+// the GPU work + issues `map_async`, then each subsequent frame polls the
+// device and checks whether the callback has delivered. Once it has, the
+// caller reads the mapped buffer, encodes PNG, and triggers a download.
+
+/// In-flight export job. Holds the readback buffer (the GPU writes the final
+/// pixels here) and a non-blocking receiver that the map-async callback uses
+/// to signal completion. Lives in `State` between frames.
+#[cfg(target_arch = "wasm32")]
+pub struct PendingExport {
+    pub width: u32,
+    pub height: u32,
+    pub padded_row_bytes: u32,
+    pub unpadded_row_bytes: u32,
+    pub readback: wgpu::Buffer,
+    pub rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl ErebusRenderer {
+    /// Wasm export step 1: submit all GPU work + queue the readback. Returns
+    /// a `PendingExport` that the caller stores in `State` and polls via
+    /// `try_finish_export` on subsequent frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_equirect_export(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        frame: FrameUniforms,
+        nebula: NebulaUniforms,
+        lighting: LightingUniforms,
+        starfield: StarfieldUniforms,
+        post: PostUniforms,
+    ) -> anyhow::Result<PendingExport> {
+        anyhow::ensure!(width > 0 && height > 0, "export size must be non-zero");
+
+        let export_hdr = HdrTarget::new(&self.device, (width, height));
+        let export_bloom = BloomPyramid::new(&self.device, (width, height));
+
+        let export_output = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("erebus.export.output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: EXPORT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let export_output_view =
+            export_output.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let unpadded_row_bytes = width * 4;
+        let row_align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row_bytes = unpadded_row_bytes.div_ceil(row_align) * row_align;
+        let buffer_size = (padded_row_bytes as u64) * (height as u64);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("erebus.export.readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bloom_downsample_bgs = build_bloom_downsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_hdr.view,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let bloom_upsample_bgs = build_bloom_upsample_bgs(
+            &self.device,
+            &self.bloom_bgl,
+            &export_bloom,
+            &self.sampler,
+            &self.post_buffer,
+        );
+        let tonemap_bg = create_tonemap_bg(
+            &self.device,
+            &self.tonemap_bgl,
+            &export_hdr.view,
+            &export_bloom.mips[0],
+            &self.sampler,
+            &self.post_buffer,
+        );
+
+        let mut f = frame;
+        f.resolution = [width as f32, height as f32];
+        let mut p = post;
+        p.resolution = [width as f32, height as f32];
+        queue.write_buffer(&self.frame_buffer, 0, bytes_of(&f));
+        queue.write_buffer(&self.nebula_buffer, 0, bytes_of(&nebula));
+        queue.write_buffer(&self.lighting_buffer, 0, bytes_of(&lighting));
+        queue.write_buffer(&self.starfield_buffer, 0, bytes_of(&starfield));
+        queue.write_buffer(&self.post_buffer, 0, bytes_of(&p));
+
+        let mut encoder =
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("erebus.export.encoder"),
+                });
+
+        let want_bake = BakeUniforms {
+            seed: frame.seed,
+            octaves: nebula.octaves_density,
+            lacunarity: nebula.lacunarity,
+            gain: nebula.gain,
+        };
+        let needs_bake = match self.last_bake {
+            None => true,
+            Some(prev) => prev.differs(&want_bake),
+        };
+        if needs_bake {
+            queue.write_buffer(&self.bake_buffer, 0, bytes_of(&want_bake));
+            let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("erebus.export.bake_3d_noise"),
+                timestamp_writes: None,
+            });
+            compute.set_pipeline(&self.bake_pipeline);
+            compute.set_bind_group(0, &self.bake_bg, &[]);
+            compute.dispatch_workgroups(32, 32, 32);
+            drop(compute);
+            self.last_bake = Some(want_bake);
+        }
+
+        // Nebula → export HDR.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erebus.export.pass.nebula"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &export_hdr.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.nebula_pipeline);
+            pass.set_bind_group(0, &self.nebula_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // Bloom downsample chain.
+        let mip_count = export_bloom.mip_count() as usize;
+        for i in 0..mip_count {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erebus.export.pass.bloom.down"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &export_bloom.mips[i],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if i == 0 {
+                pass.set_pipeline(&self.bloom_downsample_first_pipeline);
+            } else {
+                pass.set_pipeline(&self.bloom_downsample_pipeline);
+            }
+            pass.set_bind_group(0, &bloom_downsample_bgs[i], &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // Bloom upsample chain.
+        if mip_count > 1 {
+            for i in (0..(mip_count - 1)).rev() {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("erebus.export.pass.bloom.up"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &export_bloom.mips[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.bloom_upsample_pipeline);
+                pass.set_bind_group(0, &bloom_upsample_bgs[i], &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+
+        // Tonemap → export output.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erebus.export.pass.tonemap"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &export_output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.export_tonemap_pipeline);
+            pass.set_bind_group(0, &tonemap_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &export_output,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), wgpu::BufferAsyncError>>(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+
+        Ok(PendingExport {
+            width,
+            height,
+            padded_row_bytes,
+            unpadded_row_bytes,
+            readback,
+            rx,
+        })
+    }
+
+    /// Drive wgpu's internal state machine. Must be called every frame while
+    /// an export is in flight so `map_async` callbacks have a chance to fire.
+    pub fn poll_export_progress(&self) {
+        self.device.poll(wgpu::Maintain::Poll);
+    }
+
+    /// Wasm export step 2: non-blocking check on the in-flight readback.
+    /// Returns `Ok(Some(pixels))` once the GPU is done, `Ok(None)` if still
+    /// pending, `Err(...)` if the readback failed.
+    pub fn try_finish_export(
+        &self,
+        job: &PendingExport,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        match job.rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("readback channel: {e}")),
+            Ok(Err(e)) => Err(anyhow::anyhow!("buffer map: {e:?}")),
+            Ok(Ok(())) => {
+                let slice = job.readback.slice(..);
+                let mapped = slice.get_mapped_range();
+                let mut out = Vec::with_capacity(
+                    (job.unpadded_row_bytes as usize) * (job.height as usize),
+                );
+                for row in 0..job.height {
+                    let row_start = (row as usize) * (job.padded_row_bytes as usize);
+                    let row_end = row_start + (job.unpadded_row_bytes as usize);
+                    out.extend_from_slice(&mapped[row_start..row_end]);
+                }
+                drop(mapped);
+                job.readback.unmap();
+                Ok(Some(out))
+            }
+        }
+    }
+}
+
+/// IEEE 754 f16 bit pattern → f32. Subnormals flush to zero (acceptable for
+/// our pixel data — bloom + nebula values are well above subnormal range).
+fn f16_bits_to_f32(half: u16) -> f32 {
+    let sign = ((half >> 15) & 1) as u32;
+    let exp = ((half >> 10) & 0x1f) as u32;
+    let mant = (half & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        sign << 31
+    } else if exp == 0x1f {
+        (sign << 31) | 0x7f80_0000 | (mant << 13)
+    } else {
+        let e = exp + (127 - 15);
+        (sign << 31) | (e << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Encode the shared nebula → bloom-down → bloom-up → tonemap pass sequence
+/// against a caller-supplied set of resources. Used by all three render
+/// methods (live preview, equirect PNG, cubemap PNG, equirect EXR).
+#[allow(clippy::too_many_arguments)]
+fn encode_pipeline_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    nebula_pipeline: &wgpu::RenderPipeline,
+    nebula_bg: &wgpu::BindGroup,
+    bloom_down_first_pipeline: &wgpu::RenderPipeline,
+    bloom_down_pipeline: &wgpu::RenderPipeline,
+    bloom_up_pipeline: &wgpu::RenderPipeline,
+    final_pipeline: &wgpu::RenderPipeline,
+    final_bg: &wgpu::BindGroup,
+    hdr: &HdrTarget,
+    bloom: &BloomPyramid,
+    final_view: &wgpu::TextureView,
+    bloom_downsample_bgs: &[wgpu::BindGroup],
+    bloom_upsample_bgs: &[wgpu::BindGroup],
+) {
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("erebus.encode.nebula"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &hdr.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(nebula_pipeline);
+        pass.set_bind_group(0, nebula_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    let mip_count = bloom.mip_count() as usize;
+    for i in 0..mip_count {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("erebus.encode.bloom.down"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &bloom.mips[i],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if i == 0 {
+            pass.set_pipeline(bloom_down_first_pipeline);
+        } else {
+            pass.set_pipeline(bloom_down_pipeline);
+        }
+        pass.set_bind_group(0, &bloom_downsample_bgs[i], &[]);
+        pass.draw(0..3, 0..1);
+    }
+    if mip_count > 1 {
+        for i in (0..(mip_count - 1)).rev() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("erebus.encode.bloom.up"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &bloom.mips[i],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(bloom_up_pipeline);
+            pass.set_bind_group(0, &bloom_upsample_bgs[i], &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("erebus.encode.final"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: final_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(final_pipeline);
+        pass.set_bind_group(0, final_bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -1023,9 +2010,11 @@ struct PipelineSet {
     bloom_upsample: wgpu::RenderPipeline,
     tonemap: wgpu::RenderPipeline,
     export_tonemap: wgpu::RenderPipeline,
+    export_linear: wgpu::RenderPipeline,
 }
 
 pub const EXPORT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const EXPORT_LINEAR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 fn build_pipelines(
     device: &wgpu::Device,
@@ -1035,13 +2024,12 @@ fn build_pipelines(
     bloom_bgl: &wgpu::BindGroupLayout,
     tonemap_bgl: &wgpu::BindGroupLayout,
 ) -> anyhow::Result<PipelineSet> {
-    let root = shader_root();
-    let fullscreen_src = read_shader(&root.join("fullscreen.wgsl"))?;
-    let nebula_src = read_shader(&root.join("nebula").join("raymarch.wgsl"))?;
-    let composite_src = read_shader(&root.join("composite.wgsl"))?;
-    let bake_src = read_shader(&root.join("compute").join("bake_3d_noise.wgsl"))?;
-    let bloom_down_src = read_shader(&root.join("bloom").join("downsample.wgsl"))?;
-    let bloom_up_src = read_shader(&root.join("bloom").join("upsample.wgsl"))?;
+    let fullscreen_src = load_shader("fullscreen.wgsl")?;
+    let nebula_src = load_shader("nebula/raymarch.wgsl")?;
+    let composite_src = load_shader("composite.wgsl")?;
+    let bake_src = load_shader("compute/bake_3d_noise.wgsl")?;
+    let bloom_down_src = load_shader("bloom/downsample.wgsl")?;
+    let bloom_up_src = load_shader("bloom/upsample.wgsl")?;
 
     validate(&fullscreen_src, "fullscreen.wgsl")?;
     validate(&nebula_src, "nebula/raymarch.wgsl")?;
@@ -1101,7 +2089,7 @@ fn build_pipelines(
         layout: Some(&nebula_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1110,7 +2098,7 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &nebula_mod,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
@@ -1119,6 +2107,7 @@ fn build_pipelines(
             })],
         }),
         multiview: None,
+        cache: None,
     });
 
     let bloom_target = wgpu::ColorTargetState {
@@ -1131,7 +2120,7 @@ fn build_pipelines(
         layout: Some(&bloom_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1140,11 +2129,12 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &bloom_down_mod,
-            entry_point: "fs_main_first",
+            entry_point: Some("fs_main_first"),
             compilation_options: Default::default(),
             targets: &[Some(bloom_target.clone())],
         }),
         multiview: None,
+        cache: None,
     });
 
     let bloom_down = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1152,7 +2142,7 @@ fn build_pipelines(
         layout: Some(&bloom_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1161,11 +2151,12 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &bloom_down_mod,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(bloom_target.clone())],
         }),
         multiview: None,
+        cache: None,
     });
 
     let bloom_up = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1173,7 +2164,7 @@ fn build_pipelines(
         layout: Some(&bloom_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1182,7 +2173,7 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &bloom_up_mod,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
@@ -1200,6 +2191,7 @@ fn build_pipelines(
             })],
         }),
         multiview: None,
+        cache: None,
     });
 
     let tonemap = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1207,7 +2199,7 @@ fn build_pipelines(
         layout: Some(&tonemap_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1216,7 +2208,7 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &composite_mod,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -1225,6 +2217,7 @@ fn build_pipelines(
             })],
         }),
         multiview: None,
+        cache: None,
     });
 
     let export_tonemap = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1232,7 +2225,7 @@ fn build_pipelines(
         layout: Some(&tonemap_layout),
         vertex: wgpu::VertexState {
             module: &fullscreen_mod,
-            entry_point: "vs_main",
+            entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -1241,7 +2234,7 @@ fn build_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &composite_mod,
-            entry_point: "fs_main",
+            entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: EXPORT_FORMAT,
@@ -1250,14 +2243,42 @@ fn build_pipelines(
             })],
         }),
         multiview: None,
+        cache: None,
+    });
+
+    let export_linear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("erebus.pipeline.tonemap.linear"),
+        layout: Some(&tonemap_layout),
+        vertex: wgpu::VertexState {
+            module: &fullscreen_mod,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &composite_mod,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: EXPORT_LINEAR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
     });
 
     let bake = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("erebus.pipeline.bake_3d_noise"),
         layout: Some(&bake_layout),
         module: &bake_mod,
-        entry_point: "cs_main",
+        entry_point: Some("cs_main"),
         compilation_options: Default::default(),
+        cache: None,
     });
 
     Ok(PipelineSet {
@@ -1268,15 +2289,57 @@ fn build_pipelines(
         bloom_upsample: bloom_up,
         tonemap,
         export_tonemap,
+        export_linear,
     })
 }
 
-fn read_shader(path: &PathBuf) -> anyhow::Result<String> {
-    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+/// Native: read the requested shader file from disk so hot-reload sees
+/// edits. WASM: return the version baked into the binary via `include_str!`,
+/// since the browser sandbox has no filesystem.
+fn load_shader(rel_path: &str) -> anyhow::Result<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let path = shader_root().join(rel_path);
+        return std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(match rel_path {
+            "fullscreen.wgsl" => include_str!("../../shaders/fullscreen.wgsl").to_string(),
+            "composite.wgsl" => include_str!("../../shaders/composite.wgsl").to_string(),
+            "nebula/raymarch.wgsl" => {
+                include_str!("../../shaders/nebula/raymarch.wgsl").to_string()
+            }
+            "compute/bake_3d_noise.wgsl" => {
+                include_str!("../../shaders/compute/bake_3d_noise.wgsl").to_string()
+            }
+            "bloom/downsample.wgsl" => {
+                include_str!("../../shaders/bloom/downsample.wgsl").to_string()
+            }
+            "bloom/upsample.wgsl" => {
+                include_str!("../../shaders/bloom/upsample.wgsl").to_string()
+            }
+            other => anyhow::bail!("unknown shader path: {other}"),
+        })
+    }
 }
 
+
+// Native: re-export of `naga` lives at `wgpu::naga` so we get
+// source-located error messages before the shader hits the device.
+// WASM: `wgpu::naga` isn't re-exported on the web target, so we skip the
+// pre-validation and let `wgpu::Device::create_shader_module` produce the
+// final error if any.
+#[cfg(not(target_arch = "wasm32"))]
 fn validate(src: &str, name: &str) -> anyhow::Result<()> {
     wgpu::naga::front::wgsl::parse_str(src)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{name}:\n{}", e.emit_to_string(src)))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate(_src: &str, _name: &str) -> anyhow::Result<()> {
+    Ok(())
 }
