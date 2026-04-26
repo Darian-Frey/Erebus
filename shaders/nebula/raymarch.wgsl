@@ -59,6 +59,26 @@ struct Lighting {
     _pad0: u32,
 };
 
+struct Starfield {
+    density: f32,
+    brightness: f32,
+    layers: u32,
+    imf_exponent: f32,
+
+    psf_threshold: f32,
+    psf_intensity: f32,
+    spike_count: u32,
+    spike_length: f32,
+
+    temperature_min: f32,
+    temperature_max: f32,
+    galactic_strength: f32,
+    galactic_width: f32,
+
+    galactic_dir: vec3<f32>,
+    _pad0: f32,
+};
+
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<uniform> nebula: Nebula;
 @group(0) @binding(2) var<uniform> lighting: Lighting;
@@ -66,6 +86,28 @@ struct Lighting {
 @group(0) @binding(4) var gradient_sampler: sampler;
 @group(0) @binding(5) var noise_3d: texture_3d<f32>;
 @group(0) @binding(6) var noise_sampler: sampler;
+@group(0) @binding(7) var<uniform> starfield: Starfield;
+@group(0) @binding(8) var blackbody_tex: texture_1d<f32>;
+@group(0) @binding(9) var blackbody_sampler: sampler;
+
+// PCG3D — re-introduced for the grid-hash starfield since the procedural
+// noise (which used to host this) was replaced by the baked volume.
+fn pcg3d(v_in: vec3<u32>) -> vec3<u32> {
+    var v = v_in * 1664525u + 1013904223u;
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v = v ^ (v >> vec3<u32>(16u));
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    return v;
+}
+
+fn hash3i(p: vec3<i32>, seed: u32) -> vec3<f32> {
+    let u = vec3<u32>(bitcast<u32>(p.x), bitcast<u32>(p.y), bitcast<u32>(p.z));
+    return vec3<f32>(pcg3d(u ^ vec3<u32>(seed))) * (1.0 / 4294967296.0);
+}
 
 // ---- Mappings --------------------------------------------------------------
 
@@ -175,6 +217,92 @@ fn sample_lights(p: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
     return total;
 }
 
+// ---- Starfield -------------------------------------------------------------
+
+// 1.0 inside the galactic plane band, falling off gaussian-style outside.
+fn galactic_band(dir: vec3<f32>) -> f32 {
+    let n = normalize(starfield.galactic_dir);
+    let d = dot(dir, n);
+    let w = max(starfield.galactic_width, 1e-3);
+    return exp(-(d * d) / (w * w));
+}
+
+fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
+    let grid = dir * scale;
+    let cell = vec3<i32>(floor(grid));
+    let h = hash3i(cell, frame.seed ^ layer_seed);
+
+    // Per-cell existence probability. Galactic plane lifts the threshold so
+    // the band is markedly denser than the rest of the sphere.
+    let band = galactic_band(dir);
+    let presence_threshold = 0.93 - 0.06 * (band * starfield.galactic_strength);
+    if (h.x < presence_threshold) {
+        return vec3<f32>(0.0);
+    }
+
+    // Star direction: cell centre + jitter, kept inside the cell middle so
+    // adjacent cells don't have stars touching at the boundary.
+    let star_pos = (vec3<f32>(cell) + h * 0.6 + 0.2) / scale;
+    let star_dir = normalize(star_pos);
+
+    let cos_t = clamp(dot(dir, star_dir), -1.0, 1.0);
+    let ang_sq = max(2.0 - 2.0 * cos_t, 0.0);
+
+    // IMF-biased magnitude: pow(rand, exp) where exp~5 gives ~95 % dim stars.
+    let mag = pow(h.y, starfield.imf_exponent);
+
+    // Tight gaussian core. Falloff scaled by grid density so cells get a
+    // roughly constant pixel-size star regardless of density slider.
+    let core_falloff = scale * scale * 100.0;
+    let core = exp(-ang_sq * core_falloff) * mag;
+
+    // 4-spoke diffraction cross for stars above the PSF threshold. Phase 5
+    // will replace this with a proper N-fold spike pattern + FFT bloom.
+    var spikes: f32 = 0.0;
+    if (mag > starfield.psf_threshold) {
+        let delta = dir - star_dir;
+        // Build a cheap orthonormal basis on the sphere — pick the smaller
+        // axis for the up-vector to avoid degenerating near poles.
+        let up = select(
+            vec3<f32>(0.0, 1.0, 0.0),
+            vec3<f32>(1.0, 0.0, 0.0),
+            abs(star_dir.y) > 0.95,
+        );
+        let tx = normalize(cross(up, star_dir));
+        let ty = cross(star_dir, tx);
+        let dx = dot(delta, tx);
+        let dy = dot(delta, ty);
+        let ax = abs(dx);
+        let ay = abs(dy);
+        let h_spike = exp(-ay * 600.0) * smoothstep(starfield.spike_length, 0.0, ax);
+        let v_spike = exp(-ax * 600.0) * smoothstep(starfield.spike_length, 0.0, ay);
+        spikes = max(h_spike, v_spike) * starfield.psf_intensity * mag;
+    }
+
+    // Independent hash for temperature so colour is uncorrelated with
+    // magnitude. Sharing `h.y` would pin bright stars to `T_max` and dim
+    // stars to `T_min` — and since IMF biases the field toward sub-pixel
+    // dim stars, the visible population would all sit at `T_max`, making
+    // the temperature_min slider almost imperceptible. With this fresh
+    // hash you get red giants and blue dwarfs at all magnitudes.
+    let temp_h = hash3i(cell + vec3<i32>(13, 17, 23), frame.seed ^ layer_seed);
+    let temp = mix(starfield.temperature_min, starfield.temperature_max, temp_h.x);
+    let temp_uv = clamp((temp - 1000.0) / 39000.0, 0.0, 1.0);
+    let color = textureSampleLevel(blackbody_tex, blackbody_sampler, temp_uv, 0.0).rgb;
+
+    return color * (core + spikes) * starfield.brightness;
+}
+
+fn sample_starfield(dir: vec3<f32>) -> vec3<f32> {
+    var col = vec3<f32>(0.0);
+    let n = min(starfield.layers, 3u);
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        let scale = starfield.density * pow(2.0, f32(i));
+        col = col + star_layer(dir, scale, 1664525u * (i + 1u));
+    }
+    return col;
+}
+
 // ---- Fragment --------------------------------------------------------------
 
 struct FsIn {
@@ -232,6 +360,12 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
         }
     }
 
-    let intensity = exp2(frame.exposure);
-    return vec4<f32>(colour * intensity, 1.0);
+    // Stars lie behind the nebula at infinity — `transmittance` after the
+    // march is exactly the fraction of background light reaching the camera.
+    let stars = sample_starfield(dir) * transmittance;
+    let final_colour = colour + stars;
+
+    // Exposure moved to the post pass (Phase 5) so bloom thresholds against
+    // unexposed scene radiance.
+    return vec4<f32>(final_colour, 1.0);
 }

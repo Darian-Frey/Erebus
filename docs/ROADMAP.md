@@ -75,71 +75,97 @@ The ordering is deliberate: get pixels on screen before polishing UI, get HDR ri
 
 ---
 
-## Phase 4 — Starfield (M3)
+## Phase 4 — Starfield (M3) ✅
 
 **Goal:** layered, blackbody-correct stars with diffraction spikes.
 
-- [ ] `shaders/starfield/grid_hash.wgsl`: 3-level grid hash with parallax depth offsets.
-- [ ] Compute pass `bake_blackbody` producing a 1024-texel blackbody LUT (1000K–40000K).
-- [ ] IMF-weighted brightness sampler (`pow(rand, 3.0)` baseline).
-- [ ] Galactic-plane density mask (tilted band, FBM-modulated).
-- [ ] Optional density coupling: bright stars cluster inside nebula gas (Spacescape technique).
-- [ ] `shaders/starfield/psf.wgsl`: PSF billboard for stars above brightness threshold; airy disk + N-fold spikes; size cropped by inverse-square.
-- [ ] Sub-pixel jitter for "twinkle" / re-AA.
+- [x] **Grid-hash starfield** with 1–3 parallax layers (each layer 2× the grid scale of the previous). PCG3D hash per cell; jittered star direction kept inside the cell middle so adjacent cells don't have stars touching at the boundary. Currently inlined into [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl) as `sample_starfield(dir)` rather than a separate pass — single fragment shader pipeline keeps the bind group small and the nebula-occlusion math (multiply by post-march transmittance) trivial. Splits into `shaders/starfield/grid_hash.wgsl` when a Phase 5 shader composer lands.
+- [~] **Compute `bake_blackbody` deferred** — replaced with a CPU-baked 1024-texel RGBA16F LUT in [src/render/resources/textures.rs](../src/render/resources/textures.rs) using Mitchell Charity's polynomial (8 KB upload, no compute pipeline needed since the LUT is seed-independent). Runs once at startup.
+- [x] **IMF-weighted brightness**: `mag = pow(rand, imf_exponent)` with default exponent 5 (pushes ~95 % of stars to dim end of the distribution).
+- [x] **Galactic-plane density mask**: gaussian falloff from a user-adjustable tilted plane normal lifts the per-cell presence threshold, making the band visibly denser than the rest of the sphere.
+- [~] **Nebula-density coupling deferred to Phase 5/7** — requires sampling the nebula density at the starfield's "behind-the-volume" direction, which is straightforward but adds another texture fetch per star. Skipping for the Phase 4 minimum.
+- [x] **Diffraction spikes** for stars above `psf_threshold` (default 0.6, top ~5 % of the brightness distribution). Currently a 4-spoke axis-aligned cross built from a per-star tangent basis. Phase 5 replaces this with a proper N-fold pattern + FFT convolution bloom.
+- [~] **Sub-pixel jitter / twinkle deferred** — would re-introduce the per-frame temporal aliasing that bug #5 just fixed. Land alongside TAA in Phase 5.
+- [x] **Nebula occlusion** for free: stars are added as `sample_starfield(dir) * post_march_transmittance` so dense nebula regions correctly attenuate the background.
 
-**Exit:** a stars-only render at 4K survives a side-by-side comparison with a real Hubble background — colour distribution and density gradient look right.
+**Exit:** stars-only render shows realistic distribution (galactic band, IMF-biased magnitudes, blackbody colour spread from cool red to hot blue), bright stars get diffraction spikes, dense nebula regions correctly hide background stars. ✅
+
+**Deviations:**
+
+- Stars share the nebula's render pipeline rather than running as a separate additive pass. Saves ~8 lines of plumbing and makes nebula-occlusion automatic. The trade-off: starfield can't be enabled while nebula is disabled (since the pipeline is shared) — but `density_scale=0` + `count=0` lights does effectively the same thing.
+- Single LUT for blackbody, no separate compute bake — physics doesn't depend on seed, so a CPU bake at startup is sufficient.
 
 ---
 
-## Phase 5 — Post chain (M4)
+## Phase 5 — Post chain (M4) ✅
 
 **Goal:** ship-quality HDR → display pipeline.
 
-- [ ] Bloom pyramid: 6–8-mip downsample (13-tap CoD:AW) + tent upsample composite.
-- [ ] Karis average on the brightest mip to suppress firefly stars.
-- [ ] Tone-map shaders: AgX (default), ACES Fitted, Tony McMapface, Reinhard.
-- [ ] Exposure (stops) slider as the primary brightness control.
-- [ ] Optional grade: lift / gamma / gain or simple sat/contrast.
-- [ ] Triangular-PDF deband dither at the end of the chain.
-- [ ] **Deferred:** FFT convolution bloom for cinematic spikes (post-release stretch).
+- [x] **Bloom pyramid** with up to 5 mips (`MAX_MIPS = 5`, dynamically clamped to `log2(min_dim) - 2` for small targets). Per-mip TextureViews + bind groups, rebuilt on HDR resize. See [src/render/resources/textures.rs](../src/render/resources/textures.rs).
+- [x] **13-tap CoD:AW Jimenez downsample** in [shaders/bloom/downsample.wgsl](../shaders/bloom/downsample.wgsl) with two entry points: `fs_main_first` (threshold + Karis average per-tap, used only on the first mip) and `fs_main` (plain 13-tap, used on all subsequent mips).
+- [x] **9-tap tent upsample** with additive blend at the pipeline level — `BlendComponent { src: One, dst: One, op: Add }`. See [shaders/bloom/upsample.wgsl](../shaders/bloom/upsample.wgsl). Tap radius scaled by `bloom_radius` uniform.
+- [x] **Karis-weighted firefly suppression** on the first downsample. Each cluster of 4 taps is averaged with inverse-luminance weights so a single bright star pixel can't dominate the cluster.
+- [x] **Tonemap shaders** in [shaders/composite.wgsl](../shaders/composite.wgsl): AgX (default; Sobotka — Three.js port with sRGB↔Rec.2020 inset/outset matrices and 6th-order polynomial), ACES Fitted (Narkowicz one-liner), Reinhard (`x / 1+x`). Switchable via `tonemap_mode` uniform; UI is a combo box.
+- [~] **Tony McMapface deferred** — needs a 48³ 3D LUT and a corresponding loader. Land in Phase 7 polish alongside the user-editable gradient widget.
+- [x] **Exposure (stops)** moved out of the raymarch into the post pass so bloom thresholds against unexposed scene radiance. Phase-2 `frame.exposure` field is left in `FrameUniforms` for backward compat but the value is no longer applied in the raymarch.
+- [x] **Saturation + contrast grade** sliders. Lift/gamma/gain deferred to Phase 7 — saturation around Rec.709 luminance and contrast around middle grey are enough for the look range we currently care about.
+- [x] **Triangular-PDF deband dither** at the very end of the post chain (after tonemap, before swapchain write). Two IGN samples differenced, scaled to ±1/255. `deband_amount` uniform multiplier (0 disables).
+- [~] **FFT convolution bloom deferred** — post-release stretch as the roadmap noted.
 
-**Exit:** flipping between tone-maps shows clearly different aesthetics, none clip; bloom is energy-conserving (intensity 0 ≡ no bloom).
+**Exit:** flipping between AgX/ACES/Reinhard shows clearly different aesthetics; bloom is energy-conserving at intensity = 0 (no contribution); deband eliminates banding in dark gas regions; cores no longer clip flat-white. ✅
+
+**Bug log:** WGSL doesn't allow unary `+` in polynomial expressions — see [BUGS.md #6](BUGS.md). One-line fix.
 
 ---
 
-## Phase 6 — Export (M5)
+## Phase 6 — Export (M5) ✅ (MVP)
 
 **Goal:** render and save a 16K equirect or 6×4K cubemap.
 
-- [ ] `export::tiling` splits the export viewport into 4K tiles with adjusted ray basis per tile.
-- [ ] Supersample at 1×, 2×, 4× (linear downfilter on CPU).
-- [ ] `export::png` 8-bit sRGB writer.
-- [ ] `export::exr` linear OpenEXR writer (16- or 32-bit float).
-- [ ] `export::equirect` and `export::cubemap` per-mode camera basis.
-- [ ] Optional cube-cross or six-PNG-folder packaging; optional `.dds`.
-- [ ] Progress UI with cancel.
+Phase-6 MVP shipped: equirect PNG export at 1K / 2K / 4K / 8K, single-shot direct render (no tiling), synchronous (UI freezes for 1–3 s during render). Tiling for 16K and EXR/cubemap support are tracked as Phase 6.5 below.
 
-**Exit:** a 16K × 8K equirect PNG renders without OOM and tiles seamlessly along the longitude wrap.
+- [x] `export::png` 8-bit sRGB writer ([src/export/png.rs](../src/export/png.rs)).
+- [x] `export::equirect` reuses the existing equirect ray mapping in `nebula/raymarch.wgsl` — no extra camera basis math needed for the equirect mode.
+- [x] `ErebusRenderer::render_equirect_rgba8` allocates a one-shot set of HDR / bloom-pyramid / output / readback resources sized for the chosen export width, runs the full nebula → bloom → tonemap chain, and reads back the sRGB-encoded RGBA8 pixels via `device.poll(Wait)`. Per-row buffer alignment honours `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`. See [src/render/graph.rs](../src/render/graph.rs).
+- [x] Dedicated `export_tonemap_pipeline` targeting `Rgba8UnormSrgb` so the readback bytes are PNG-ready without per-pixel format swizzling.
+- [x] Export panel UI in [src/gui/panels.rs](../src/gui/panels.rs) with width combo box (1K / 2K / 4K / 8K) and an `Export PNG…` button that opens a native file dialog (`rfd::FileDialog::save_file`) with a sensible default filename (`erebus_equirect_<W>.png`).
+- [x] App update loop handles the `pending_export` flag — runs the dialog, the GPU render, and the file write in sequence; reports the result back into the UI status line.
 
-**Risks:** GPU memory on consumer hardware. 16K direct render needs > 1 GB tile budget; tiling makes it tractable but readback bandwidth is the new bottleneck.
+**Phase 6.5 (deferred):**
+
+- [ ] `export::tiling` — split the viewport into 4K tiles with per-tile ray-basis adjustments. Required for 16K+ since wgpu's default `max_texture_dimension_2d` is 8192.
+- [ ] Supersample 1× / 2× / 4× with linear box-filter downfilter on CPU.
+- [ ] `export::exr` — linear OpenEXR writer using the existing `exr` crate dep. Skips the tonemap pass and writes the HDR target directly.
+- [ ] `export::cubemap` — 6 face renders with per-face camera basis, cross / six-PNG-folder / `.dds` packaging.
+- [ ] Background thread + progress UI with cancel — currently the UI freezes during the render (~1–3 s at 8K on a discrete GPU).
+
+**Exit (MVP):** a 4K equirect PNG renders into a user-chosen location, looks identical to the live preview, and tiles seamlessly in longitude. ✅
+
+**Exit (full):** a 16K × 8K equirect PNG renders without OOM and tiles seamlessly along the longitude wrap.
+
+**Risks:** GPU memory on consumer hardware. 16K direct render needs > 1 GB tile budget; tiling makes it tractable but readback bandwidth becomes the new bottleneck. Phase 6 MVP avoids the question by capping at 8K, which fits in ~500 MB total resident GPU memory.
 
 ---
 
-## Phase 7 — UI polish & presets (M6)
+## Phase 7 — UI polish & presets (M6) ✅ (MVP)
 
 **Goal:** a UI a customer would pay for.
 
-- [ ] Six panels: Nebula, Starfield, Lighting, PostFX, Export, Presets.
-- [ ] Custom gradient widget: drag-stops, Kelvin slider, hex input, copy/paste.
-- [ ] Per-slider tooltips with units (Kelvin, stops, anisotropy).
-- [ ] `preset::schema` finalised; `format_version` = 1.
-- [ ] `preset::io` save/load via `rfd`; recent presets list.
-- [ ] `preset::migrate` stub for future versions.
-- [ ] Three shipped presets: synthwave, cyberpunk, retro_scifi.
-- [ ] Compact 200-char preset string (base64 of MessagePack-encoded values) for sharing.
-- [ ] Synthwave-leaning egui theme.
+- [x] Seven panels (Preset, Frame, PostFX, Nebula, Lighting, Starfield, Export). Preset moved to the top so it's the first thing a returning user reaches for.
+- [~] **Custom gradient widget deferred to Phase 8** — needs a drag-stops + Kelvin slider + hex input widget set. The gradient *data* now flows through presets cleanly; what's missing is the in-app editor. Users can edit gradients today by hand-editing the saved RON files.
+- [x] Tooltips on every non-obvious slider with units and defaults (HG anisotropy, σₑ, IMF exponent, lacunarity, density curve, Kelvin temperatures, transmittance cutoff, step density bias, etc.). Hover any slider label to see them.
+- [x] `preset::schema::Preset` shipped with `format_version = 1`. Includes seed, all four uniform blocks, and the gradient stops Vec. `_pad` fields are `#[serde(skip)]` so the on-disk RON is human-friendly. See [src/preset/schema.rs](../src/preset/schema.rs).
+- [x] `preset::io::save_to_file` / `load_from_file` via [src/preset/io.rs](../src/preset/io.rs); native file dialogs through `rfd`.
+- [x] `preset::migrate::migrate` stub in [src/preset/migrate.rs](../src/preset/migrate.rs) — runs in a loop with arms keyed on `format_version`. Currently a no-op since v1 is the first shipped version.
+- [x] Three shipped presets, embedded via `include_str!` so they ship inside the binary: [synthwave.ron](../assets/presets/synthwave.ron) (magenta + cyan + violet, AgX), [cyberpunk.ron](../assets/presets/cyberpunk.ron) (hot pink + electric purple + black, AgX, sharper filaments), [retro_scifi.ron](../assets/presets/retro_scifi.ron) (amber + teal + burgundy, ACES Fitted, softer gas).
+- [x] Unit tests in [src/preset/mod.rs](../src/preset/mod.rs) cover load + round-trip serialise/deserialise for all three shipped presets, gating against RON syntax drift.
+- [~] **Recent presets list deferred to Phase 8.**
+- [~] **Compact base64 share-string deferred to Phase 8** — needs MessagePack + base64 encoders; design question whether to share the raw struct or a hash-keyed deterministic regen.
+- [~] **Synthwave-leaning egui theme deferred to Phase 8** — current dark theme with a magenta accent is OK; can iterate as part of release polish.
 
-**Exit:** non-technical user can load a preset, tweak two sliders, and export a 4K PNG — without reading docs.
+**Exit:** the user can pick one of three shipped presets, tweak any slider with a tooltip explaining what it does, save the result to a `.ron` file, reopen it later. ✅
+
+**Bug log:** RON serializes Rust fixed-size arrays as tuples (parens) not lists (brackets). See [BUGS.md #7](BUGS.md). Fixed in all three shipped RONs.
 
 ---
 

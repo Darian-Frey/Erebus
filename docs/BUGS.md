@@ -19,6 +19,60 @@ Number entries monotonically. Don't reuse numbers when bugs are deleted — leav
 
 ---
 
+## #8 — Starfield Kelvin sliders had no perceptible effect — 2026-04-26 — fixed
+
+**Symptom.** Setting `T_min` and `T_max` to extreme values (both very low expecting red, both very high expecting blue) produced visually identical exports — stars stayed pale-blue/white in both cases. The user noticed and flagged it.
+
+**Root cause.** The starfield shader keyed both `magnitude` and `temperature` off the same hash component `h.y`:
+
+```wgsl
+let mag = pow(h.y, starfield.imf_exponent);
+let temp = mix(starfield.temperature_min, starfield.temperature_max, h.y);
+```
+
+Coupled in this way, bright stars (high `h.y`) always pinned to `T_max` and dim stars (low `h.y`) always pinned to `T_min`. Because the IMF exponent (default 5) biases the field toward dim sub-pixel stars, the only *visible* stars were the ~5 % brightest — which were all locked to `T_max`. Result: `T_min` was effectively ignored, and the field was monochromatic at any single moment.
+
+**Fix.** Sample a second hash with a fixed integer offset for the temperature roll, in [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl):
+
+```wgsl
+let temp_h = hash3i(cell + vec3<i32>(13, 17, 23), frame.seed ^ layer_seed);
+let temp = mix(starfield.temperature_min, starfield.temperature_max, temp_h.x);
+```
+
+Cost: one extra PCG3D per star (negligible). Visual benefit: red giants and blue dwarfs at all magnitudes; both Kelvin sliders now drive a clearly visible response.
+
+**Lesson.** Whenever two random outcomes are sampled from the same hash channel, ask whether the correlation is intentional (e.g. mass-luminosity for *physically* realistic stars) or accidental (e.g. accidentally fused-domain-hashing). Here a *more* physically realistic version (mass-temperature coupling) was less *visually* useful because the IMF skews the visible population to one end.
+
+---
+
+## #7 — RON serializes Rust fixed-size arrays as tuples, not lists — 2026-04-26 — fixed
+
+**Symptom.** All three shipped preset RONs failed to load with `Expected opening '('` at the position of `lights: [...]`. The unit tests `shipped_presets_load` and `shipped_presets_round_trip` exposed this immediately.
+
+**Root cause.** I'd written the `[PointLight; 4]` array as a JSON-style list `[a, b, c, d]`. RON serializes Rust *fixed-size arrays* as tuples — `(a, b, c, d)` — and only `Vec<T>` as lists. The `gradient: Vec<GradientStop>` field is correctly a list; `lights: [PointLight; 4]` must be a tuple.
+
+**Fix.** Changed the `lights:` field's brackets in [synthwave.ron](../assets/presets/synthwave.ron), [cyberpunk.ron](../assets/presets/cyberpunk.ron), [retro_scifi.ron](../assets/presets/retro_scifi.ron) from `[...]` to `(...)`.
+
+**Lesson.** When hand-writing RON for any Rust struct, sketch a tiny `ron::ser::to_string_pretty(&default_value, ...)` first and copy the format. Don't assume JSON-list syntax is interchangeable with RON tuple syntax — the distinction matters when the Rust type is a fixed-size array vs a `Vec`.
+
+---
+
+## #6 — WGSL rejects unary `+` in expressions — 2026-04-26 — fixed
+
+**Symptom.** `cargo test --test wgsl_validation` failed with `error: expected expression, found '+'` at the AgX polynomial in [shaders/composite.wgsl](../shaders/composite.wgsl):
+
+```wgsl
+return + 15.5 * x4 * x2 - 40.14 * x4 * x + ...;
+```
+
+**Root cause.** WGSL only supports unary `-`, not unary `+`. The leading `+` was a copy-paste from the GLSL/HLSL Three.js AgX reference, which both accept it.
+
+**Fix.** Dropped the leading `+` and added an explicit `vec3<f32>(0.00232)` in the trailing constant term so naga's vector arithmetic could resolve the type. Same lesson for any future shader port from GLSL: scan for `return + …` and `return -<scalar>` patterns.
+
+**Lesson.** When porting math from GLSL/HLSL to WGSL, run the file through `cargo test --test wgsl_validation` immediately rather than relying on the runtime device validation — naga's error messages point straight at the offending line.
+
+---
+
 ## #5 — Per-frame IGN rotation reads as flicker without TAA — 2026-04-26 — fixed
 
 **Symptom.** With Phase 3.5 baked-noise speedup running at ~40 fps, the user reported the nebula was visibly flickering frame-to-frame on a static scene.

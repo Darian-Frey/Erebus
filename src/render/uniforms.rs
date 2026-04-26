@@ -2,6 +2,20 @@
 // Field order and padding here MUST match the matching WGSL `struct` exactly.
 
 use bytemuck::{Pod, Zeroable};
+use serde::{Deserialize, Serialize};
+
+// `default` here lets new fields appear in older preset RONs without
+// the loader exploding. `skip` keeps `_pad*` words out of the on-disk
+// representation.
+fn zero_u32() -> u32 {
+    0
+}
+fn zero_f32() -> f32 {
+    0.0
+}
+fn zero_pad2() -> [f32; 2] {
+    [0.0; 2]
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -63,10 +77,115 @@ impl BakeUniforms {
     }
 }
 
+// Post-processing parameters (3 vec4 = 48 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
+pub struct PostUniforms {
+    pub exposure: f32,        // EV stops applied right before tonemap
+    pub tonemap_mode: u32,    // 0 = AgX, 1 = ACES Fitted, 2 = Reinhard
+    pub bloom_intensity: f32, // 0..2; 0 disables bloom contribution
+    pub bloom_threshold: f32, // luminance threshold for first-mip bright pass
+
+    pub bloom_radius: f32,     // tent filter radius in pixels of next-finer mip
+    pub deband_amount: f32,    // 0..1 multiplier on triangular dither
+    pub grade_saturation: f32, // 1.0 neutral
+    pub grade_contrast: f32,   // 1.0 neutral, ~1.1 for "punchy"
+
+    // resolution is a per-frame value injected by the renderer; never part
+    // of a saved preset.
+    #[serde(skip, default = "default_resolution")]
+    pub resolution: [f32; 2],
+    #[serde(skip, default = "zero_pad2")]
+    pub _pad: [f32; 2],
+}
+
+fn default_resolution() -> [f32; 2] {
+    [1.0, 1.0]
+}
+
+impl Default for PostUniforms {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            tonemap_mode: 0, // AgX is the agreed default per Phase 5 research.
+            bloom_intensity: 0.6,
+            bloom_threshold: 1.0,
+            bloom_radius: 1.0,
+            deband_amount: 1.0,
+            grade_saturation: 1.0,
+            grade_contrast: 1.0,
+            resolution: [1.0, 1.0],
+            _pad: [0.0; 2],
+        }
+    }
+}
+
+// Per-pass bloom flag. Tells the downsample shader whether to apply the
+// brightness-threshold + Karis-average path (only on the first mip) or the
+// plain 13-tap path (every subsequent mip). 16 bytes — the smallest std140
+// uniform block we can ship.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct BloomPassUniforms {
+    pub apply_threshold: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+// Starfield parameters (4 vec4 = 64 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
+pub struct StarfieldUniforms {
+    pub density: f32,        // grid scale of layer 0 (cells per radian-ish)
+    pub brightness: f32,     // global multiplier
+    pub layers: u32,         // 1..=3 parallax octaves
+    pub imf_exponent: f32,   // pow(rand, exp) — biases toward dim stars
+
+    pub psf_threshold: f32,  // brightness above which diffraction spikes appear
+    pub psf_intensity: f32,  // spike multiplier
+    pub spike_count: u32,    // currently 4 (axis-aligned cross); 6/8 in Phase 5
+    pub spike_length: f32,   // angular extent of each spike
+
+    pub temperature_min: f32,    // K — cool red stars
+    pub temperature_max: f32,    // K — hot blue stars
+    pub galactic_strength: f32,  // density boost in the galactic plane
+    pub galactic_width: f32,     // gaussian falloff width away from plane
+
+    pub galactic_dir: [f32; 3],  // tilted up-vector of the galactic plane
+    #[serde(skip, default = "zero_f32")]
+    pub _pad0: f32,
+}
+
+impl Default for StarfieldUniforms {
+    fn default() -> Self {
+        Self {
+            density: 80.0,
+            brightness: 1.0,
+            layers: 3,
+            imf_exponent: 5.0,
+
+            psf_threshold: 0.6,
+            psf_intensity: 0.4,
+            spike_count: 4,
+            spike_length: 0.012,
+
+            temperature_min: 2700.0,
+            temperature_max: 30000.0,
+            galactic_strength: 1.5,
+            galactic_width: 0.3,
+
+            // Slightly tilted band to avoid axis-aligned blandness.
+            galactic_dir: [0.3, 1.0, 0.2],
+            _pad0: 0.0,
+        }
+    }
+}
+
 // In-volume point light. Two vec4-sized rows = 32 bytes; an array of 4 fits
 // std140 with no extra padding.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
 pub struct PointLight {
     pub position: [f32; 3],
     pub falloff: f32, // exponent in 1 / dist^falloff
@@ -86,12 +205,13 @@ impl PointLight {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
 pub struct LightingUniforms {
     pub lights: [PointLight; 4],
     pub count: u32,
     pub shadow_steps: u32,
     pub ambient_emission: f32,
+    #[serde(skip, default = "zero_u32")]
     pub _pad0: u32,
 }
 
@@ -129,7 +249,7 @@ impl Default for LightingUniforms {
 
 // Nebula raymarch parameters. All vec4-aligned for std140-compatible layout.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
 pub struct NebulaUniforms {
     // Shape
     pub density_scale: f32,
@@ -140,6 +260,7 @@ pub struct NebulaUniforms {
     pub ridged_blend: f32,
     pub warp_strength: f32,
     pub octaves_warp: u32,
+    #[serde(skip, default = "zero_u32")]
     pub _pad0: u32,
 
     // March

@@ -1,6 +1,68 @@
-// Synthwave preset: magenta -> cyan -> deep blue gradient, strong bloom.
-// Placeholder — actual values populated in Phase 4.
-(
+// Synthwave — magenta + hot pink + cyan core, default starter palette.
+// All-defaults parameters with the canonical synthwave gradient.
+Preset(
     format_version: 1,
     name: "Synthwave",
+    seed: 3405691582,
+    nebula: NebulaUniforms(
+        density_scale: 1.6,
+        octaves_density: 6,
+        lacunarity: 2.02,
+        gain: 0.5,
+        ridged_blend: 0.5,
+        warp_strength: 1.5,
+        octaves_warp: 3,
+        steps: 96,
+        march_length: 1.0,
+        transmittance_cutoff: 0.01,
+        step_density_bias: 1.5,
+        sigma_e: 2.0,
+        albedo: 0.6,
+        hg_g: 0.6,
+        density_curve: 0.5,
+    ),
+    lighting: LightingUniforms(
+        lights: (
+            PointLight(position: (0.35, 0.20, 0.30), falloff: 2.0, color: (1.00, 0.85, 0.65), intensity: 4.0),
+            PointLight(position: (-0.30, -0.10, -0.20), falloff: 2.5, color: (0.45, 0.65, 1.00), intensity: 1.5),
+            PointLight(position: (0.0, 0.0, 0.0), falloff: 2.0, color: (1.0, 1.0, 1.0), intensity: 0.0),
+            PointLight(position: (0.0, 0.0, 0.0), falloff: 2.0, color: (1.0, 1.0, 1.0), intensity: 0.0),
+        ),
+        count: 2,
+        shadow_steps: 4,
+        ambient_emission: 0.25,
+    ),
+    starfield: StarfieldUniforms(
+        density: 80.0,
+        brightness: 1.0,
+        layers: 3,
+        imf_exponent: 5.0,
+        psf_threshold: 0.6,
+        psf_intensity: 0.4,
+        spike_count: 4,
+        spike_length: 0.012,
+        temperature_min: 2700.0,
+        temperature_max: 30000.0,
+        galactic_strength: 1.5,
+        galactic_width: 0.3,
+        galactic_dir: (0.3, 1.0, 0.2),
+    ),
+    post: PostUniforms(
+        exposure: 0.0,
+        tonemap_mode: 0,
+        bloom_intensity: 0.6,
+        bloom_threshold: 1.0,
+        bloom_radius: 1.0,
+        deband_amount: 1.0,
+        grade_saturation: 1.5,
+        grade_contrast: 1.2,
+    ),
+    gradient: [
+        GradientStop(position: 0.00, color: (0.00, 0.00, 0.00)),
+        GradientStop(position: 0.10, color: (0.04, 0.00, 0.10)),
+        GradientStop(position: 0.30, color: (0.30, 0.05, 0.45)),
+        GradientStop(position: 0.55, color: (0.85, 0.20, 0.65)),
+        GradientStop(position: 0.78, color: (0.40, 0.55, 1.20)),
+        GradientStop(position: 1.00, color: (1.20, 1.10, 1.40)),
+    ],
 )

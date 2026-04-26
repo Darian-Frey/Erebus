@@ -6,7 +6,10 @@ pub mod widgets;
 pub mod theme;
 
 use crate::app::state::State;
-use crate::render::{ErebusRenderer, FrameUniforms, LightingUniforms, NebulaUniforms};
+use crate::render::{
+    ErebusRenderer, FrameUniforms, LightingUniforms, NebulaUniforms, PostUniforms,
+    StarfieldUniforms,
+};
 
 pub fn render(ctx: &egui::Context, state: &mut State) {
     egui::SidePanel::left("controls")
@@ -37,7 +40,7 @@ pub fn render(ctx: &egui::Context, state: &mut State) {
             let frame = FrameUniforms {
                 resolution: [target_size.0 as f32, target_size.1 as f32],
                 time: state.time,
-                exposure: state.exposure,
+                exposure: state.post.exposure,
                 seed: state.seed,
                 frame_index: state.frame_index,
                 ..Default::default()
@@ -49,6 +52,8 @@ pub fn render(ctx: &egui::Context, state: &mut State) {
                     frame,
                     nebula: state.nebula,
                     lighting: state.lighting,
+                    starfield: state.starfield,
+                    post: state.post,
                     target_size,
                 },
             );
@@ -60,6 +65,8 @@ struct NebulaCallback {
     frame: FrameUniforms,
     nebula: NebulaUniforms,
     lighting: LightingUniforms,
+    starfield: StarfieldUniforms,
+    post: PostUniforms,
     target_size: (u32, u32),
 }
 
@@ -79,6 +86,8 @@ impl egui_wgpu::CallbackTrait for NebulaCallback {
                 self.frame,
                 self.nebula,
                 self.lighting,
+                self.starfield,
+                self.post,
                 self.target_size,
             );
         }

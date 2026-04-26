@@ -80,15 +80,38 @@ The `albedo_color` from the gradient LUT colours both the self-glow and the per-
 
 ## `starfield/grid_hash.wgsl`
 
-- 3 parallax layers with relative scale 1×, 0.5×, 0.25× and brightness multiplier 1.0, 0.5, 0.25.
-- Hash function: PCG3D — small, fast, no visible repetition at our scales.
-- IMF biasing: `temperature = mix(2700, 30000, pow(rand, 3.0))`.
+Phase 4 ships starfield inlined into `nebula/raymarch.wgsl` as `sample_starfield(dir)`. Splits into its own file when a shader composer arrives.
+
+| Parameter | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `density` | 80.0 | 20–200 | Grid scale of layer 0; doubles each layer. Higher = more, smaller stars. |
+| `brightness` | 1.0 | 0–4 | Global multiplier on all layers. |
+| `layers` | 3 | 1–3 | Number of parallax octaves. |
+| `imf_exponent` | 5.0 | 1–8 | `mag = pow(rand, exp)`. 5 → ~95 % dim, 1 → uniform. |
+| `galactic_strength` | 1.5 | 0–4 | Lift to per-cell presence threshold inside the band. |
+| `galactic_width` | 0.3 | 0.05–1 | Gaussian falloff away from the plane. |
+| `galactic_dir` | (0.3, 1.0, 0.2) | unit-ish | Plane normal — tilt the band. |
+
+Per-cell logic: PCG3D hash of `(cell_index, frame.seed ^ layer_seed)` gives `(presence, magnitude, colour_t)`. If `presence < threshold(galactic_band)`, no star. Otherwise the star direction is `(cell + 0.6·rand + 0.2) / scale` normalised — kept inside the cell middle so adjacent stars don't kiss at the boundary.
+
+Star core falloff: `exp(-ang_sq * scale² * 100)` so cells render at roughly constant pixel size as `density` changes.
+
+**Stars get nebula occlusion for free** because they're added to the fragment colour as `sample_starfield(dir) * post_march_transmittance` — the residual transmittance after the volumetric march is exactly the fraction of background light reaching the camera.
 
 ## `starfield/psf.wgsl`
 
-- Threshold for PSF billboard: top ~5% brightest stars. Below threshold, single-pixel emission is fine because bloom catches them.
-- Spike count user-exposed (4 / 6 / 8). 6-spoke matches JWST aesthetic.
-- Reference: tiffnix.com/star-rendering.
+| Parameter | Default | Range | Notes |
+| --- | --- | --- | --- |
+| `psf_threshold` | 0.6 | 0–1 | Stars above this magnitude get diffraction spikes (~5 % of distribution). |
+| `psf_intensity` | 0.4 | 0–2 | Spike multiplier on top of core brightness. |
+| `spike_count` | 4 | 4–8 | Currently the WGSL builds a 4-spoke axis-aligned cross; the slider is plumbed for Phase 5's N-fold pattern + FFT bloom. |
+| `spike_length` | 0.012 | 0.001–0.05 | Angular extent of each spike. |
+
+Phase-4 spike construction: build a tangent basis on the unit sphere from the star direction (avoiding pole degeneracy by switching the up-vector when `|star.y| > 0.95`), project the ray-to-star delta into `(tx, ty)`, and `max(exp(-ay·600) · smoothstep(spike_length, 0, ax), exp(-ax·600) · smoothstep(spike_length, 0, ay))`. Cheap; not physically correct (a real airy disk has the right Bessel-function radial profile + 6-fold spikes from JWST-style hexagonal apertures). Phase 5's FFT convolution bloom replaces this with proper diffraction.
+
+## `starfield/blackbody`
+
+CPU-baked 1024-texel 1D RGBA16F LUT spanning 1000 K → 40000 K, baked once at startup in [src/render/resources/textures.rs](../src/render/resources/textures.rs) using Mitchell Charity's regression polynomial. Sampled in the fragment via linear filtering. The temperature for each star is currently keyed off the same hash as magnitude (`h.y`) so bright stars correlate with hot blue colours — a physically reasonable approximation of the mass-luminosity relationship without computing it explicitly.
 
 ## `bloom/`
 
