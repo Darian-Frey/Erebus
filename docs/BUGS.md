@@ -6,7 +6,7 @@ Running ledger of bugs encountered during development, their root cause, and the
 
 Each entry uses this shape:
 
-```
+```markdown
 ## #N — short title — YYYY-MM-DD — [open|fixed]
 
 **Symptom.** What you observed.
@@ -16,6 +16,18 @@ Each entry uses this shape:
 ```
 
 Number entries monotonically. Don't reuse numbers when bugs are deleted — leave a tombstone (`#N — withdrawn`).
+
+---
+
+## #5 — Per-frame IGN rotation reads as flicker without TAA — 2026-04-26 — fixed
+
+**Symptom.** With Phase 3.5 baked-noise speedup running at ~40 fps, the user reported the nebula was visibly flickering frame-to-frame on a static scene.
+
+**Root cause.** Phase 2's `ign(pixel, frame_index)` rotated the interleaved-gradient noise tile per frame so that residual sampling artifacts would smear into temporal noise. The original assumption was that downstream bloom + tonemap (Phase 5) would smooth the rotation into perceptual mush. Without bloom present, the rotation IS the flicker — every frame's first-sample jitter offset shifts by ~1 step length, so the band of pixels that catches a thin density spike changes visibly each frame. At 40 fps with a static scene the temporal aliasing is unmistakable.
+
+**Fix.** Made `ign()` purely spatial in [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl) — dropped the `frame_index` argument. The temporal jitter will be re-introduced in Phase 5 alongside proper TAA-style accumulation where bloom hides the residual.
+
+**Lesson.** Don't ship temporal aliasing tricks without the temporal smoothing they were designed against. "It'll get smeared by bloom later" is a valid argument *only after bloom exists* — until then, static jitter is correct.
 
 ---
 

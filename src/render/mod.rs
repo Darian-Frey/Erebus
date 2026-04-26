@@ -9,4 +9,4 @@ pub mod passes;
 pub mod resources;
 
 pub use graph::ErebusRenderer;
-pub use uniforms::FrameUniforms;
+pub use uniforms::{FrameUniforms, LightingUniforms, NebulaUniforms};

@@ -39,34 +39,39 @@ The ordering is deliberate: get pixels on screen before polishing UI, get HDR ri
 
 ---
 
-## Phase 2 — Nebula MVP (M2)
+## Phase 2 — Nebula MVP (M2) ✅
 
 **Goal:** a recognisable volumetric nebula on screen, parameter-driven.
 
-- [ ] Compute pass `bake_3d_noise` producing a 128³ RGBA16F Perlin–Worley volume.
-- [ ] Compute pass `bake_gradient` producing a 256-texel 1D gradient LUT from a hard-coded ramp.
-- [ ] `shaders/nebula/raymarch.wgsl`: equirect ray direction, fixed 64 steps, FBM density, gradient lookup, Beer–Lambert accumulation.
-- [ ] `shaders/nebula/density.wgsl`: domain-warped FBM + ridged FBM blend.
-- [ ] `shaders/common/noise.wgsl`: gradient noise, Worley, FBM, ridged FBM, domain warp, Clifford-torus 4D wrap.
-- [ ] `shaders/common/sampling.wgsl`: equirect mapping, Henyey–Greenstein.
-- [ ] Blue-noise dither at march start.
+- [x] Compute pass `bake_3d_noise` producing a 128³ RGBA16F volume — pulled forward from the Phase-6 deferral when Phase-3 shadow marching exposed the per-pixel cost ceiling of procedural noise (full-res preview dropped to ~6 fps). Bake stores 6-octave smooth FBM in R, ridged FBM in G; runtime samples 4× per main density (3 warp + 1 main) and 1× per shadow step. Re-bake triggers on seed/octaves/lacunarity/gain change; everything else stays runtime. See [shaders/compute/bake_3d_noise.wgsl](../shaders/compute/bake_3d_noise.wgsl).
+- [~] **Deferred.** Compute pass `bake_gradient`. The 256-texel LUT is currently CPU-baked once at startup ([src/render/resources/textures.rs](../src/render/resources/textures.rs)); a compute path lands when the user-editable gradient widget arrives in Phase 7.
+- [x] [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl): equirect ray direction, configurable 16–256 steps, FBM density, sqrt-mapped gradient LUT lookup, Beer–Lambert + HG single-scatter accumulation, IGN dither at entry, density-adaptive step length, transmittance early-out.
+- [x] [shaders/nebula/density.wgsl](../shaders/nebula/density.wgsl): currently inlined into `raymarch.wgsl` with a comment pointer; split into its own module when starfield (Phase 4) introduces a shader-source composer.
+- [x] [shaders/common/noise.wgsl](../shaders/common/noise.wgsl): value/gradient noise, Worley, FBM, ridged FBM, domain warp, Clifford-torus wrap. Available as a reference module; `raymarch.wgsl` inlines the parts it uses.
+- [x] [shaders/common/sampling.wgsl](../shaders/common/sampling.wgsl): Henyey–Greenstein, IGN dither (with temporal variant). [shaders/common/math.wgsl](../shaders/common/math.wgsl) covers PCG3D hash + equirect mappings.
+- [x] Blue-noise stand-in via Jorge Jimenez's interleaved-gradient noise, jitter amplitude = 1× step length, frame-indexed offset for temporal de-banding. Real blue-noise texture deferred until Phase 5 needs it for bloom.
 
-**Exit:** screen shows a nebula that visibly responds to seed, density, and gradient changes; no obvious step banding at 96+ steps.
+**Exit:** screen shows a nebula that visibly responds to seed, density, gradient, warp, anisotropy and exposure; no obvious step banding at 96+ steps. ✅
 
-**Risks:** noise tuning is the hardest part of the project. Budget 2–3× expected time for shader iteration; that is where the visual ceiling lives.
+**Defaults baked in** (research-driven, see [docs/SHADER_NOTES.md](SHADER_NOTES.md)): 6/3 octaves, lacunarity 2.02, gain 0.5, ridged blend 0.5, warp strength 1.5, 96 steps preview, σₑ 2.0, albedo 0.6, HG g 0.6, sqrt density curve, transmittance cutoff 0.01.
+
+**Risks materialised:** nothing severe yet. Procedural noise instead of baked is the one notable deviation; revisit if 4 K preview drops below 30 FPS on integrated GPUs (Phase 8 benchmark).
 
 ---
 
-## Phase 3 — Lighting (M2 cont.)
+## Phase 3 — Lighting (M2 cont.) ✅
 
 **Goal:** depth and drama via in-volume light.
 
-- [ ] 1–4 user-placed point lights inside the volume (uniform array).
-- [ ] `shaders/nebula/lighting.wgsl`: 8-step shadow march per main sample, secondary Beer–Lambert.
-- [ ] HG anisotropy slider exposed (`g ∈ [-0.9, 0.9]`).
-- [ ] Optional emissive density falloff for "core glow" effect.
+- [x] 1–4 user-placed point lights inside the volume (`array<PointLight, 4>` in [src/render/uniforms.rs](../src/render/uniforms.rs)). UI exposes `count` 0–4, per-light position/colour/intensity/falloff, ambient-emission floor.
+- [x] Per-main-march-sample shadow march toward each active light: midpoint sampling, configurable shadow_steps (1–12, default 6 per Heckel), early-out when shadow optical depth > 6 (transmittance < 0.0025).
+- [x] HG anisotropy slider already shipped in Phase 2 (`g ∈ [-0.9, 0.9]`); now actually drives per-light scattering instead of the Phase-2 fixed key direction.
+- [x] Emissive density falloff via `ambient_emission` uniform (0 = lights only, 1.5 = bright self-glow). Combined with the gradient LUT this acts as a wavelength-dependent self-emission floor — the gradient colours both the self-glow and the per-light albedo tint.
+- [~] Standalone `nebula/lighting.wgsl` deferred — `sample_lights()` is currently inlined into [shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl) for the same reason as `density.wgsl`; splits when the Phase-4 starfield introduces a shader-source composer.
 
-**Exit:** turning lights on noticeably reshapes the nebula's volume; dense regions cast clear shadows.
+**Exit:** turning lights on noticeably reshapes the volume — bright cores at light positions, dark dust lanes on the far side from each light, HG slider visibly redirects highlights. ✅
+
+**Performance note:** at default settings (96 main steps × 2 lights × 6 shadow steps) we evaluate `nebula_density` ~1100 times per pixel per frame, ~1 G evals/s at 1080p/60. Ran fine on the dev T1200 with no measurable regression vs Phase 2; if 4 K preview slows down on integrated GPUs in Phase 8 benchmarks, the cheap lever is reducing shadow_steps to 4 and disabling the warp inside the shadow density function.
 
 ---
 

@@ -27,6 +27,7 @@ pub fn run() -> anyhow::Result<()> {
 struct ErebusApp {
     state: state::State,
     start: std::time::Instant,
+    last_frame: std::time::Instant,
 }
 
 impl ErebusApp {
@@ -45,16 +46,30 @@ impl ErebusApp {
             .callback_resources
             .insert(renderer);
 
+        let now = std::time::Instant::now();
         Ok(Self {
             state: state::State::default(),
-            start: std::time::Instant::now(),
+            start: now,
+            last_frame: now,
         })
     }
 }
 
 impl eframe::App for ErebusApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = std::time::Instant::now();
+        let dt_ms = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
+        self.last_frame = now;
         self.state.time = self.start.elapsed().as_secs_f32();
+        self.state.frame_index = self.state.frame_index.wrapping_add(1);
+        // Exponential moving average — smooths the noisy per-frame jitter.
+        let a = 0.1;
+        self.state.frame_ms_ema = self.state.frame_ms_ema * (1.0 - a) + dt_ms * a;
+        self.state.fps_ema = if self.state.frame_ms_ema > 0.0 {
+            1000.0 / self.state.frame_ms_ema
+        } else {
+            0.0
+        };
 
         // Drain shader-watcher events and surface any compile error to the UI.
         if let Some(wgpu_state) = frame.wgpu_render_state() {
