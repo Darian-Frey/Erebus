@@ -84,7 +84,12 @@ impl BakeUniforms {
     }
 }
 
-// Post-processing parameters (3 vec4 = 48 bytes).
+// Post-processing parameters (5 vec4 = 80 bytes).
+//
+// Includes the skybox-preview camera (`view_mode` + yaw/pitch/fov_y/aspect)
+// because the composite pass already binds this UBO and branches on
+// view_mode to switch between flat equirect display and orbit-camera
+// resampling. Keeping the skybox params here avoids a second bind group.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
 pub struct PostUniforms {
@@ -104,6 +109,28 @@ pub struct PostUniforms {
     pub resolution: [f32; 2],
     #[serde(skip, default = "zero_pad2")]
     pub _pad: [f32; 2],
+
+    // ---- Skybox preview camera --------------------------------------------
+    // Live-only — never serialised. composite.wgsl branches: 0 = sample HDR
+    // by screen UV (flat equirect), 1 = reconstruct a camera ray from screen
+    // UV + camera state, convert to equirect UV, sample there.
+    #[serde(skip, default = "zero_u32")]
+    pub view_mode: u32,
+    #[serde(skip, default = "zero_f32")]
+    pub yaw: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub pitch: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub fov_y: f32, // radians
+
+    #[serde(skip, default = "zero_f32")]
+    pub aspect: f32, // canvas width / height
+    #[serde(skip, default = "zero_f32")]
+    pub _pad2: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub _pad3: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub _pad4: f32,
 }
 
 fn default_resolution() -> [f32; 2] {
@@ -123,6 +150,14 @@ impl Default for PostUniforms {
             grade_contrast: 1.0,
             resolution: [1.0, 1.0],
             _pad: [0.0; 2],
+            view_mode: 0,
+            yaw: 0.0,
+            pitch: 0.0,
+            fov_y: 70.0_f32.to_radians(),
+            aspect: 1.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+            _pad4: 0.0,
         }
     }
 }

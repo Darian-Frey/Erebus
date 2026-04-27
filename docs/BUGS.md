@@ -34,6 +34,8 @@ Number entries monotonically. Don't reuse numbers when bugs are deleted — leav
 
 **Lesson.** A 3D shell-of-cells parametrisation of a unit sphere has hidden duplicate neighbours along the radial axis — *do not* use a 3D box neighbourhood loop on `floor(dir * scale)`. Either keep evaluation single-cell (and constrain the kernel) or change the parametrisation to one that's natively 2D on the sphere.
 
+**Follow-up (2026-04-27).** Replaced the 3D cube hash with **octahedral 2D mapping** (Cigolle et al. 2014) in [shaders/nebula/raymarch.wgsl::dir_to_oct / star_layer](../shaders/nebula/raymarch.wgsl). The unit direction now projects to a [-1, 1]² square via L1-norm + corner unfold; cells hash on (u, v, 0). Solid-angle distortion drops from ~3× (cube) to ~1.5× at the worst (square corners), with no axis alignment, so the visible "constellation" clustering at high yaw/pitch is gone. Single-cell evaluation kept (no neighbour search) — same per-pixel cost as the original cube-grid version but uniform sphere coverage. Star layer hashes are now properly independent across the 3 parallax octaves.
+
 ---
 
 ## #10 — `textureSample` inside non-uniform control flow rejected by WebGPU — 2026-04-26 — fixed

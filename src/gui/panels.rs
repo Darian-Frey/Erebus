@@ -1,7 +1,7 @@
 // Phase 2 panel surface: Frame + Nebula sliders. More groups land in
 // Phase 3 (Lighting), Phase 4 (Starfield), Phase 5 (PostFX).
 
-use crate::app::state::{QualityTier, State, ViewMode};
+use crate::app::state::{OrbitCamera, QualityTier, State, ViewMode};
 use crate::export::{ExportFormat, ExportKind, ExportRequest};
 use crate::preset::{PresetAction, ShippedPreset};
 
@@ -220,11 +220,14 @@ fn export_group(ui: &mut egui::Ui, state: &mut State) {
             }
 
             ui.horizontal(|ui| {
-                // Wasm caps at 4K — 8K equirect at Export-tier step counts
-                // would freeze the tab for ~30 s and risk OOM during the
-                // tiled GPU readback.
+                // Wasm caps at 1K. 2K at Quality-tier (128 march × 6 shadow
+                // × 3 star layers + bloom) still triggers Chrome's GPU
+                // watchdog (TDR) on integrated GPUs, which crashes the
+                // device and blanks the tab. 1K renders cleanly in a few
+                // seconds and the user can upscale offline if they need
+                // more pixels. Higher resolutions ship in the desktop build.
                 #[cfg(target_arch = "wasm32")]
-                let labels: &[(u32, &str)] = &[(1024, "1K"), (2048, "2K"), (4096, "4K")];
+                let labels: &[(u32, &str)] = &[(1024, "1K")];
                 #[cfg(not(target_arch = "wasm32"))]
                 let labels: &[(u32, &str)] = match state.export_kind {
                     ExportKind::Equirect => &[(1024, "1K"), (2048, "2K"), (4096, "4K"), (8192, "8K")],
@@ -234,8 +237,8 @@ fn export_group(ui: &mut egui::Ui, state: &mut State) {
                     ExportKind::Cubemap => &[(512, "512"), (1024, "1K"), (2048, "2K"), (4096, "4K")],
                 };
                 #[cfg(target_arch = "wasm32")]
-                if state.export_width > 4096 {
-                    state.export_width = 2048;
+                if state.export_width != 1024 {
+                    state.export_width = 1024;
                 }
                 ui.label(match state.export_kind {
                     ExportKind::Equirect => "width",
@@ -456,28 +459,55 @@ fn frame_group(ui: &mut egui::Ui, state: &mut State) {
             });
             ui.horizontal(|ui| {
                 ui.label("view").on_hover_text(
-                    "Live-preview projection. Equirect shows the full 2:1 \
-                     skybox (with pole stretching at the top/bottom of the \
-                     canvas). Cube faces show a flat 90°-FOV pinhole view of \
-                     one direction — what your in-engine camera will see. \
-                     Export is unaffected.",
+                    "Live-preview projection. Flat shows the equirect 2:1 \
+                     unwrap directly (with pole stretching). Skybox lets you \
+                     drag in the canvas to look around the cached scene — \
+                     dragging is free, no nebula re-march. Scroll over the \
+                     canvas to adjust FOV. Export is unaffected.",
                 );
                 egui::ComboBox::from_id_salt("view_mode")
                     .selected_text(state.view_mode.label())
                     .show_ui(ui, |ui| {
-                        for m in [
-                            ViewMode::Equirect,
-                            ViewMode::PosX,
-                            ViewMode::NegX,
-                            ViewMode::PosY,
-                            ViewMode::NegY,
-                            ViewMode::PosZ,
-                            ViewMode::NegZ,
-                        ] {
+                        for m in [ViewMode::Flat, ViewMode::Skybox] {
                             ui.selectable_value(&mut state.view_mode, m, m.label());
                         }
                     });
+                if state.view_mode == ViewMode::Skybox
+                    && ui.button("Reset view").clicked()
+                {
+                    state.orbit_camera = OrbitCamera::default();
+                }
             });
+            if state.view_mode == ViewMode::Skybox {
+                ui.horizontal(|ui| {
+                    ui.label("fov").on_hover_text(
+                        "Vertical field of view, 30°–110°. Scroll inside the canvas, \
+                         use [ / ], or drag this slider.",
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut state.orbit_camera.fov_y_deg, 30.0..=110.0)
+                            .suffix("°")
+                            .step_by(1.0),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "yaw {:>5.0}°  pitch {:>4.0}°",
+                        state.orbit_camera.yaw_rad.to_degrees(),
+                        state.orbit_camera.pitch_rad.to_degrees(),
+                    ))
+                    .weak()
+                    .monospace(),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "drag canvas to look · scroll to zoom · Space toggles · R resets · \
+                         arrows nudge · [ ] FOV",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
             ui.horizontal(|ui| {
                 ui.label("preview scale");
                 ui.add(egui::Slider::new(&mut state.preview_scale, 0.25..=1.0).step_by(0.05));

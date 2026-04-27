@@ -118,8 +118,18 @@ pub struct NoiseVolume {
 }
 
 impl NoiseVolume {
+    // 64³ on wasm vs 128³ on native: 8× fewer voxels through the FBM bake
+    // and 8× less cache pressure during raymarch. The visible loss is
+    // small once the noise is domain-warped — fine for the in-browser
+    // preview, would be visible at full Quality export which is desktop-only.
+    #[cfg(target_arch = "wasm32")]
+    pub const SIZE: u32 = 64;
+    #[cfg(not(target_arch = "wasm32"))]
     pub const SIZE: u32 = 128;
     pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+    /// Workgroup size matches `@workgroup_size(4, 4, 4)` in
+    /// `shaders/compute/bake_3d_noise.wgsl`. Dispatch SIZE/4 per axis.
+    pub const DISPATCH_PER_AXIS: u32 = Self::SIZE / 4;
 
     pub fn new(device: &wgpu::Device) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {

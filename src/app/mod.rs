@@ -24,7 +24,7 @@ use crate::render::FrameUniforms;
 /// (see [`crate::start`]) that wires the same `ErebusApp` into a canvas.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run_native() -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(config::WINDOW_TITLE)
             .with_inner_size([config::INITIAL_WIDTH, config::INITIAL_HEIGHT])
@@ -32,6 +32,14 @@ pub fn run_native() -> anyhow::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // Prefer the discrete GPU on machines that have one. Browsers default to
+    // LowPower; we replicate the override on native for parity.
+    use egui_wgpu::WgpuSetup;
+    if let WgpuSetup::CreateNew { power_preference, .. } =
+        &mut options.wgpu_options.wgpu_setup
+    {
+        *power_preference = wgpu::PowerPreference::HighPerformance;
+    }
 
     eframe::run_native(
         config::WINDOW_TITLE,
@@ -64,8 +72,36 @@ impl ErebusApp {
             .insert(renderer);
 
         let now = Instant::now();
+        #[allow(unused_mut)]
+        let mut state = state::State::default();
+
+        // Wasm: auto-load the Synthwave shipped preset on first frame so the
+        // user sees a curated composition instead of the default uniforms
+        // (which look fine but bland). On native the same defaults are
+        // already what the user expects to start from.
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Ok(p) = crate::preset::ShippedPreset::Synthwave.load() {
+                state.preset_name = p.name;
+                state.seed = p.seed;
+                state.nebula = p.nebula;
+                state.lighting = p.lighting;
+                state.starfield = p.starfield;
+                state.post = p.post;
+                state.gradient = p.gradient;
+                state.gradient_dirty = true;
+                // Re-apply wasm interactive overrides on top of the preset
+                // (presets ship with full-quality march/shadow/layer counts
+                // that would tank the live preview on integrated GPUs).
+                state.nebula.steps = 32;
+                state.lighting.shadow_steps = 2;
+                state.starfield.layers = 1;
+                state.post.bloom_intensity = 0.0;
+            }
+        }
+
         Ok(Self {
-            state: state::State::default(),
+            state,
             start: now,
             last_frame: now,
         })
@@ -79,9 +115,15 @@ impl eframe::App for ErebusApp {
         self.last_frame = now;
         self.state.time = self.start.elapsed().as_secs_f32();
         self.state.frame_index = self.state.frame_index.wrapping_add(1);
-        // Exponential moving average — smooths the noisy per-frame jitter.
+        // Exponential moving average. We deliberately ignore long gaps
+        // between updates — on wasm with conditional `request_repaint`,
+        // egui can sleep arbitrarily long when idle, and feeding those gaps
+        // into the EMA makes the displayed fps misleadingly small. Cap dt
+        // at ~33 ms (≈30 fps) so a quiet idle reads as ≥30 fps rather than
+        // the actual sleep interval. Active rendering hits the cap rarely.
         let a = 0.1;
-        self.state.frame_ms_ema = self.state.frame_ms_ema * (1.0 - a) + dt_ms * a;
+        let dt_for_ema = dt_ms.min(33.3);
+        self.state.frame_ms_ema = self.state.frame_ms_ema * (1.0 - a) + dt_for_ema * a;
         self.state.fps_ema = if self.state.frame_ms_ema > 0.0 {
             1000.0 / self.state.frame_ms_ema
         } else {
@@ -126,8 +168,34 @@ impl eframe::App for ErebusApp {
 
         gui::render(ctx, &mut self.state);
 
-        // Animated debug shader needs continuous repaint.
+        // Native: keep the existing continuous-repaint loop. egui's UI is
+        // basically free, the live preview is fast enough to spin at vsync,
+        // and this preserves all existing behaviour (animations, hot-reload
+        // polling, etc.) without conditional logic.
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.request_repaint();
+
+        // Wasm: idle CPU should be near zero. Only request another frame
+        // when something that affects what we render is actually changing:
+        //   - a slider is mid-drag (state.interacting)
+        //   - skybox inertia is still decaying
+        //   - an export is in flight (need to poll the map_async receiver)
+        //   - the offscreen cache is invalid (first frame, gradient edit,
+        //     hot-reload, hero-shot toggle) — needs one render to fill it
+        // Otherwise we let egui's own input-driven repaints handle wakeup.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let cam = &self.state.orbit_camera;
+            let want_repaint = self.state.interacting
+                || cam.yaw_rate.abs() > 1.0e-3
+                || cam.pitch_rate.abs() > 1.0e-3
+                || self.state.pending_export_job.is_some()
+                || self.state.pending_export.is_some()
+                || self.state.last_rendered_hash.is_none();
+            if want_repaint {
+                ctx.request_repaint();
+            }
+        }
 
         // Native export: synchronous pop-up file dialog + render + write.
         #[cfg(not(target_arch = "wasm32"))]
@@ -298,6 +366,23 @@ impl ErebusApp {
             ..Default::default()
         };
 
+        // Wasm-tuned export override. Native Export-tier is 256 march steps
+        // / 8 shadow steps; on browser WebGPU + integrated GPUs, that hits
+        // the GPU TDR (timeout) at 4K and crashes the device, blanking the
+        // tab. Quality-tier (128/6) renders cleanly at 1K–2K with no
+        // perceptible difference. Cap export width at 2K for the same
+        // reason — 4K on this stack is unreliable.
+        let mut nebula = self.state.nebula;
+        let mut lighting = self.state.lighting;
+        let mut starfield = self.state.starfield;
+        let mut post = self.state.post;
+        nebula.steps = nebula.steps.max(128);
+        lighting.shadow_steps = lighting.shadow_steps.max(6);
+        starfield.layers = starfield.layers.max(3);
+        if post.bloom_intensity < 0.05 {
+            post.bloom_intensity = 0.6;
+        }
+
         let (w, h) = (req.width, req.width / 2);
         log::info!("export: submitting GPU work for {w}×{h}");
         match renderer.submit_equirect_export(
@@ -305,10 +390,10 @@ impl ErebusApp {
             w,
             h,
             frame_u,
-            self.state.nebula,
-            self.state.lighting,
-            self.state.starfield,
-            self.state.post,
+            nebula,
+            lighting,
+            starfield,
+            post,
         ) {
             Ok(job) => {
                 self.state.pending_export_job = Some(job);
@@ -510,7 +595,9 @@ fn params_hash(state: &crate::app::state::State) -> u64 {
     bytemuck::bytes_of(&state.post).hash(&mut h);
     state.seed.hash(&mut h);
     state.preview_scale.to_bits().hash(&mut h);
-    (state.view_mode as u32).hash(&mut h);
+    // view_mode and orbit_camera deliberately excluded — they only affect
+    // the composite pass, not the offscreen render. The "interacting" flag
+    // in app::update gates UI responsiveness, not the offscreen freeze.
     h.finish()
 }
 

@@ -33,7 +33,17 @@ pub fn start(canvas_id: String) -> Result<(), JsValue> {
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .map_err(|_| JsValue::from_str("element is not a HtmlCanvasElement"))?;
 
-    let web_options = eframe::WebOptions::default();
+    // Force HighPerformance adapter selection. Browsers default to LowPower
+    // (integrated) which on a laptop with a dGPU costs 5–10× the framerate
+    // for free. Set on both targets — there's no reason for native to
+    // prefer integrated either.
+    let mut web_options = eframe::WebOptions::default();
+    use egui_wgpu::WgpuSetup;
+    if let WgpuSetup::CreateNew { power_preference, .. } =
+        &mut web_options.wgpu_options.wgpu_setup
+    {
+        *power_preference = wgpu::PowerPreference::HighPerformance;
+    }
 
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = eframe::WebRunner::new()

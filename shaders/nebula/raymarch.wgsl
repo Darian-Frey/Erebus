@@ -247,6 +247,18 @@ fn sample_lights(p: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
 }
 
 // ---- Starfield -------------------------------------------------------------
+//
+// Octahedral 2D hash. We project the unit direction onto an octahedron and
+// unfold into a square in [-1, 1]² — this is a standard sphere
+// parametrisation with near-uniform solid-angle coverage (worst case ~1.5×
+// distortion at the square corners, vs ~3× and grid-aligned for a 3D cube
+// hash). Crucially, every (u, v) cell maps to a UNIQUE direction on the
+// sphere — no radial duplicates like `floor(dir * scale)` had — so we get
+// honest per-direction stars and dropping the `scale * 2^i` layered hash
+// produces clean octave parallax instead of moiré clusters.
+//
+// Encoding: Cigolle et al. "A Survey of Efficient Representations for
+// Independent Unit Vectors" (JCGT 2014).
 
 // 1.0 inside the galactic plane band, falling off gaussian-style outside.
 fn galactic_band(dir: vec3<f32>) -> f32 {
@@ -256,10 +268,46 @@ fn galactic_band(dir: vec3<f32>) -> f32 {
     return exp(-(d * d) / (w * w));
 }
 
+// Unit direction → [-1, 1]² square. Continuous everywhere; the equator maps
+// to |u|+|v|=1, the +Y pole to (0, 0), and -Y to the four corners.
+fn dir_to_oct(d_in: vec3<f32>) -> vec2<f32> {
+    let n = d_in / (abs(d_in.x) + abs(d_in.y) + abs(d_in.z));
+    var uv = n.xz;
+    if (n.y < 0.0) {
+        // Lower hemisphere: unfold the octant flap into the corners.
+        let s = vec2<f32>(
+            select(-1.0, 1.0, uv.x >= 0.0),
+            select(-1.0, 1.0, uv.y >= 0.0),
+        );
+        uv = (vec2<f32>(1.0) - abs(vec2<f32>(uv.y, uv.x))) * s;
+    }
+    return uv;
+}
+
+// Inverse of dir_to_oct. Used to reconstruct the per-cell star direction
+// from a 2D cell centre (the cell uv).
+fn oct_to_dir(uv: vec2<f32>) -> vec3<f32> {
+    var d = vec3<f32>(uv.x, 1.0 - abs(uv.x) - abs(uv.y), uv.y);
+    if (d.y < 0.0) {
+        let s = vec2<f32>(
+            select(-1.0, 1.0, d.x >= 0.0),
+            select(-1.0, 1.0, d.z >= 0.0),
+        );
+        let abs_xz = abs(vec2<f32>(d.x, d.z));
+        d.x = (1.0 - abs_xz.y) * s.x;
+        d.z = (1.0 - abs_xz.x) * s.y;
+    }
+    return normalize(d);
+}
+
 fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
-    let grid = dir * scale;
-    let cell = vec3<i32>(floor(grid));
-    let h = hash3i(cell, frame.seed ^ layer_seed);
+    // Project to 2D octahedral square in [0, 1]², scale to integer cell.
+    let oct = dir_to_oct(dir) * 0.5 + 0.5;
+    let grid = oct * scale;
+    let cell = vec2<i32>(floor(grid));
+    // Hash on (cell.x, cell.y, 0) so we can keep using the existing
+    // hash3i helper without inventing a 2D variant.
+    let h = hash3i(vec3<i32>(cell, 0), frame.seed ^ layer_seed);
 
     // Per-cell existence probability. Galactic plane lifts the threshold so
     // the band is markedly denser than the rest of the sphere.
@@ -269,10 +317,12 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
 
-    // Star direction: cell centre + jitter, kept inside the cell middle so
-    // adjacent cells don't have stars touching at the boundary.
-    let star_pos = (vec3<f32>(cell) + h * 0.6 + 0.2) / scale;
-    let star_dir = normalize(star_pos);
+    // Star direction: cell centre plus jitter, kept inside the cell middle
+    // so adjacent cells don't put stars on top of each other at the
+    // boundary. Convert back to a direction via the octahedral inverse.
+    let cell_uv = (vec2<f32>(cell) + h.xy * 0.6 + 0.2) / scale;
+    let star_oct = cell_uv * 2.0 - 1.0;
+    let star_dir = oct_to_dir(star_oct);
 
     let cos_t = clamp(dot(dir, star_dir), -1.0, 1.0);
     let ang_sq = max(2.0 - 2.0 * cos_t, 0.0);
@@ -280,18 +330,21 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
     // IMF-biased magnitude: pow(rand, exp) where exp~5 gives ~95 % dim stars.
     let mag = pow(h.y, starfield.imf_exponent);
 
-    // Tight gaussian core. Falloff scaled by grid density so cells get a
-    // roughly constant pixel-size star regardless of density slider.
-    let core_falloff = scale * scale * 100.0;
+    // Gaussian core. Falloff is linear in scale so the brightest layer
+    // (smallest scale) renders ~2-pixel stars at the live preview resolution
+    // and the dimmer parallax octaves shrink toward sub-pixel as a depth
+    // cue. The previous `scale² × 100` was tuned against a much higher HDR
+    // resolution and produced sub-pixel stars at every layer — they read
+    // as quantized diamonds because rasterisation lands on a single bright
+    // pixel surrounded by fully-zero ones.
+    let core_falloff = scale * 150.0;
     let core = exp(-ang_sq * core_falloff) * mag;
 
-    // Diffraction spikes. Length is clamped to half the cell angular size so
-    // the cross fits inside one cell and never gets truncated at a boundary.
+    // Diffraction spikes. Length capped to half the cell width so the cross
+    // fits inside one cell — no need for neighbour search to avoid clipping.
     var spikes: f32 = 0.0;
     if (mag > starfield.psf_threshold) {
         let delta = dir - star_dir;
-        // Build a cheap orthonormal basis on the sphere — pick the smaller
-        // axis for the up-vector to avoid degenerating near poles.
         let up = select(
             vec3<f32>(0.0, 1.0, 0.0),
             vec3<f32>(1.0, 0.0, 0.0),
@@ -303,7 +356,7 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
         let dy = dot(delta, ty);
         let ax = abs(dx);
         let ay = abs(dy);
-        let len = min(starfield.spike_length, 0.5 / scale);
+        let len = min(starfield.spike_length, 1.0 / scale);
         let h_spike = exp(-ay * 600.0) * smoothstep(len, 0.0, ax);
         let v_spike = exp(-ax * 600.0) * smoothstep(len, 0.0, ay);
         spikes = max(h_spike, v_spike) * starfield.psf_intensity * mag;
@@ -313,9 +366,8 @@ fn star_layer(dir: vec3<f32>, scale: f32, layer_seed: u32) -> vec3<f32> {
     // magnitude. Sharing `h.y` would pin bright stars to `T_max` and dim
     // stars to `T_min` — and since IMF biases the field toward sub-pixel
     // dim stars, the visible population would all sit at `T_max`, making
-    // the temperature_min slider almost imperceptible. With this fresh
-    // hash you get red giants and blue dwarfs at all magnitudes.
-    let temp_h = hash3i(cell + vec3<i32>(13, 17, 23), frame.seed ^ layer_seed);
+    // the temperature_min slider almost imperceptible.
+    let temp_h = hash3i(vec3<i32>(cell + vec2<i32>(13, 17), 23), frame.seed ^ layer_seed);
     let temp = mix(starfield.temperature_min, starfield.temperature_max, temp_h.x);
     let temp_uv = clamp((temp - 1000.0) / 39000.0, 0.0, 1.0);
     let color = textureSampleLevel(blackbody_tex, blackbody_sampler, temp_uv, 0.0).rgb;

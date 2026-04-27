@@ -10,49 +10,55 @@ use crate::render::{
     gradient, GradientStop, LightingUniforms, NebulaUniforms, PostUniforms, StarfieldUniforms,
 };
 
-/// Live-preview projection mode. The export pipeline always renders equirect
-/// or cubemap as configured by the user — this toggle only changes how the
-/// canvas-bound preview projects the sphere.
+/// Live-preview projection mode. The export pipeline always writes equirect
+/// (or cubemap as configured) — this toggle only changes how the on-screen
+/// canvas presents the cached HDR target.
 ///
-/// Equirect is the export-faithful view but suffers heavy pole distortion
-/// (top/bottom of canvas → ±Y). The six cube-face options give a flat 90°-FOV
-/// pinhole view of one face, with no pole stretch — closer to what your
-/// in-engine camera will see when the skybox is sampled.
+/// `Flat` displays the equirect 2:1 unwrap directly: export-faithful but with
+/// heavy pole distortion when shown on a non-2:1 canvas.
+/// `Skybox` re-samples the equirect through a virtual perspective camera
+/// (mouse-drag yaw/pitch + scroll FOV). The HDR target is unchanged — only
+/// the composite pass branches — so orbiting through the cached scene is
+/// effectively free (no nebula re-march).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    Equirect,
-    PosX,
-    NegX,
-    PosY,
-    NegY,
-    PosZ,
-    NegZ,
+    Flat,
+    Skybox,
 }
 
 impl ViewMode {
     pub fn label(&self) -> &'static str {
         match self {
-            ViewMode::Equirect => "Equirect",
-            ViewMode::PosX => "+X face",
-            ViewMode::NegX => "-X face",
-            ViewMode::PosY => "+Y face",
-            ViewMode::NegY => "-Y face",
-            ViewMode::PosZ => "+Z face",
-            ViewMode::NegZ => "-Z face",
+            ViewMode::Flat => "Flat (equirect)",
+            ViewMode::Skybox => "Skybox",
         }
     }
+}
 
-    /// (frame.mode, frame.cube_face) values fed to the shader.
-    pub fn frame_uniforms(&self) -> (u32, u32) {
-        use crate::render::RENDER_MODE_CUBEMAP;
-        match self {
-            ViewMode::Equirect => (0, 0),
-            ViewMode::PosX => (RENDER_MODE_CUBEMAP, 0),
-            ViewMode::NegX => (RENDER_MODE_CUBEMAP, 1),
-            ViewMode::PosY => (RENDER_MODE_CUBEMAP, 2),
-            ViewMode::NegY => (RENDER_MODE_CUBEMAP, 3),
-            ViewMode::PosZ => (RENDER_MODE_CUBEMAP, 4),
-            ViewMode::NegZ => (RENDER_MODE_CUBEMAP, 5),
+/// Free-look orbit camera state used when `ViewMode::Skybox` is active.
+/// Yaw and pitch are stored in radians; FOV in degrees so the slider/scroll
+/// inputs map naturally. Pitch is clamped to ±89° to avoid the singularity
+/// at the poles. Not serialised into preset RON — purely viewer state.
+#[derive(Debug, Clone, Copy)]
+pub struct OrbitCamera {
+    pub yaw_rad: f32,
+    pub pitch_rad: f32,
+    pub fov_y_deg: f32,
+    /// Angular velocity (radians per second) carried over from the last
+    /// drag frame. Decays exponentially while not being driven, giving the
+    /// orbit a momentum feel after release.
+    pub yaw_rate: f32,
+    pub pitch_rate: f32,
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            yaw_rad: 0.0,
+            pitch_rad: 0.0,
+            fov_y_deg: 70.0,
+            yaw_rate: 0.0,
+            pitch_rate: 0.0,
         }
     }
 }
@@ -137,10 +143,14 @@ pub struct State {
     pub bench_running: bool,
     pub bench_results: Vec<BenchResult>,
 
-    /// Live-preview projection. Equirect (default) shows the full skybox in
-    /// 2:1 unrolled form; cube-face modes show one 90°-FOV pinhole view. Does
-    /// not affect export — the equirect/cubemap export uses its own setting.
+    /// Live-preview projection. Flat (default) shows the equirect 2:1 unwrap;
+    /// Skybox re-samples the same HDR target through a perspective camera so
+    /// the user can drag-to-look around. Does not affect export.
     pub view_mode: ViewMode,
+    /// Orbit camera state used when `view_mode == Skybox`. Driven by mouse
+    /// drag (yaw/pitch) and scroll (fov). Lives outside the offscreen-render
+    /// hash so dragging is free — only the composite pass re-runs.
+    pub orbit_camera: OrbitCamera,
 
     /// Browser-only "render hero shot" mode. While true, the GUI overrides
     /// the per-frame uniforms with Quality-tier values and lifts the wasm
@@ -222,7 +232,8 @@ impl Default for State {
             pending_bench: false,
             bench_running: false,
             bench_results: Vec::new(),
-            view_mode: ViewMode::Equirect,
+            view_mode: ViewMode::Flat,
+            orbit_camera: OrbitCamera::default(),
             hero_shot: false,
             #[cfg(target_arch = "wasm32")]
             pending_export_job: None,

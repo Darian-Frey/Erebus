@@ -25,7 +25,10 @@ struct BakeParams {
 @group(0) @binding(1) var output: texture_storage_3d<rgba16float, write>;
 
 const FBM_MAX_OCTAVES: u32 = 8u;
-const VOLUME_SIZE: u32 = 128u;
+// VOLUME_SIZE is read at runtime via textureDimensions(output) so the same
+// shader bakes 128³ on native and 64³ on wasm without needing a separate
+// pipeline. VOLUME_WORLD is fixed — different resolutions just change the
+// spatial frequency the texels can resolve, not the period.
 const VOLUME_WORLD: f32 = 8.0; // texture covers world [0, 8)
 
 fn pcg3d(v_in: vec3<u32>) -> vec3<u32> {
@@ -70,12 +73,14 @@ fn value_noise(p: vec3<f32>) -> f32 {
 
 @compute @workgroup_size(4, 4, 4)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (any(id >= vec3<u32>(VOLUME_SIZE))) {
+    let dims = textureDimensions(output);
+    if (any(id >= dims)) {
         return;
     }
 
-    // Cell index → world-space position in [0, 8).
-    let p = vec3<f32>(id) * (VOLUME_WORLD / f32(VOLUME_SIZE));
+    // Cell index → world-space position in [0, VOLUME_WORLD). dims.x assumed
+    // equal to dims.y/dims.z (the texture is always cubic).
+    let p = vec3<f32>(id) * (VOLUME_WORLD / f32(dims.x));
 
     var p_smooth = p;
     var p_ridged = p;

@@ -22,6 +22,20 @@ struct Post {
     resolution: vec2<f32>,
     _pad0: f32,
     _pad1: f32,
+
+    // Skybox preview camera. view_mode: 0 = flat (sample HDR by screen uv),
+    // 1 = orbit-camera resample (reconstruct ray, convert to equirect uv).
+    // HDR contents are identical for both modes (nebula always renders the
+    // full equirect).
+    view_mode: u32,
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+
+    aspect: f32,
+    _pad2: f32,
+    _pad3: f32,
+    _pad4: f32,
 };
 
 @group(0) @binding(0) var hdr_tex: texture_2d<f32>;
@@ -121,12 +135,70 @@ fn dither_triangular(uv: vec2<f32>) -> f32 {
     return (ign(p) - ign(p + vec2<f32>(101.7, 47.3))) * (1.0 / 255.0);
 }
 
+// ---- Skybox reconstruction -------------------------------------------------
+//
+// Inverse of the equirect mapping in shaders/nebula/raymarch.wgsl::equirect_dir.
+// Native convention: phi (longitude) ← uv.x*2-1 * PI, theta (latitude) ←
+// (uv.y - 0.5) * PI. So forward map is:
+//   x = cos(theta) * sin(phi)
+//   y = sin(theta)
+//   z = cos(theta) * cos(phi)
+// Inverse:
+//   theta = asin(y)               → uv.y = theta / PI + 0.5
+//   phi   = atan2(x, z)           → uv.x = phi   / TAU + 0.5
+
+const PI: f32  = 3.14159265358979;
+const TAU: f32 = 6.28318530717959;
+
+fn screen_uv_to_equirect(uv: vec2<f32>) -> vec2<f32> {
+    // NDC with up = +1.
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+    // Camera-space ray (right-handed, -Z forward, +Y up, +X right).
+    let tan_half = tan(post.fov_y * 0.5);
+    let cam_dir = normalize(vec3<f32>(
+        ndc.x * tan_half * post.aspect,
+        ndc.y * tan_half,
+        -1.0,
+    ));
+
+    // Pitch around X (looking up = positive pitch).
+    let cp = cos(post.pitch);
+    let sp = sin(post.pitch);
+    let after_pitch = vec3<f32>(
+        cam_dir.x,
+        cam_dir.y * cp - cam_dir.z * sp,
+        cam_dir.y * sp + cam_dir.z * cp,
+    );
+
+    // Yaw around Y. With cam-space -Z forward, yaw=0 ⇒ world +Z forward
+    // (matches our equirect's uv=(0.5,0.5) sampling +Z).
+    let cy = cos(post.yaw);
+    let sy = sin(post.yaw);
+    let world_dir = vec3<f32>(
+        after_pitch.x *  cy + after_pitch.z * -sy,
+        after_pitch.y,
+        after_pitch.x *  sy + after_pitch.z *  cy,
+    );
+
+    let phi   = atan2(world_dir.x, world_dir.z);     // longitude
+    let theta = asin(clamp(world_dir.y, -1.0, 1.0)); // latitude
+    return vec2<f32>(
+        phi   * (1.0 / TAU) + 0.5,
+        theta * (1.0 / PI)  + 0.5,
+    );
+}
+
 // ---- Fragment entry --------------------------------------------------------
 
 @fragment
 fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
-    let scene = textureSampleLevel(hdr_tex, post_sampler, in.uv, 0.0).rgb;
-    let bloom = textureSampleLevel(bloom_tex, post_sampler, in.uv, 0.0).rgb;
+    var sample_uv = in.uv;
+    if (post.view_mode == 1u) {
+        sample_uv = screen_uv_to_equirect(in.uv);
+    }
+    let scene = textureSampleLevel(hdr_tex, post_sampler, sample_uv, 0.0).rgb;
+    let bloom = textureSampleLevel(bloom_tex, post_sampler, sample_uv, 0.0).rgb;
 
     var c = scene + bloom * post.bloom_intensity;
 

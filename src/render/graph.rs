@@ -308,6 +308,17 @@ impl ErebusRenderer {
     }
 
     /// Encode every offscreen pass into the supplied encoder. The final
+    /// Re-upload the `PostUniforms` UBO without doing any of the offscreen
+    /// work. Used by the skip_prepare path so skybox camera changes
+    /// (yaw/pitch/fov) reach the composite pass even when the offscreen
+    /// render is frozen. `resolution` is overridden to the cached HDR size,
+    /// matching the convention used by `prepare()`.
+    pub fn upload_post(&self, queue: &wgpu::Queue, post: PostUniforms) {
+        let mut p = post;
+        p.resolution = [self.hdr.size.0 as f32, self.hdr.size.1 as f32];
+        queue.write_buffer(&self.post_buffer, 0, bytes_of(&p));
+    }
+
     /// tonemap pass is encoded later via `composite()` into the egui-owned
     /// render pass that already targets the swapchain.
     #[allow(clippy::too_many_arguments)]
@@ -354,7 +365,11 @@ impl ErebusRenderer {
             });
             compute.set_pipeline(&self.bake_pipeline);
             compute.set_bind_group(0, &self.bake_bg, &[]);
-            compute.dispatch_workgroups(32, 32, 32);
+            compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
             drop(compute);
             self.last_bake = Some(want_bake);
         }
@@ -568,7 +583,11 @@ impl ErebusRenderer {
             });
             compute.set_pipeline(&self.bake_pipeline);
             compute.set_bind_group(0, &self.bake_bg, &[]);
-            compute.dispatch_workgroups(32, 32, 32);
+            compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
             drop(compute);
             self.last_bake = Some(want_bake);
         }
@@ -844,7 +863,11 @@ impl ErebusRenderer {
                 });
                 compute.set_pipeline(&self.bake_pipeline);
                 compute.set_bind_group(0, &self.bake_bg, &[]);
-                compute.dispatch_workgroups(32, 32, 32);
+                compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
                 drop(compute);
                 self.last_bake = Some(want_bake);
             }
@@ -1037,7 +1060,11 @@ impl ErebusRenderer {
             });
             compute.set_pipeline(&self.bake_pipeline);
             compute.set_bind_group(0, &self.bake_bg, &[]);
-            compute.dispatch_workgroups(32, 32, 32);
+            compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
             drop(compute);
             self.last_bake = Some(want_bake);
         }
@@ -1213,7 +1240,11 @@ impl ErebusRenderer {
                 });
                 compute.set_pipeline(&self.bake_pipeline);
                 compute.set_bind_group(0, &self.bake_bg, &[]);
-                compute.dispatch_workgroups(32, 32, 32);
+                compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
             }
             queue.submit(Some(encoder.finish()));
             self.device.poll(wgpu::Maintain::Wait);
@@ -1384,7 +1415,11 @@ impl ErebusRenderer {
             });
             compute.set_pipeline(&self.bake_pipeline);
             compute.set_bind_group(0, &self.bake_bg, &[]);
-            compute.dispatch_workgroups(32, 32, 32);
+            compute.dispatch_workgroups(
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+    NoiseVolume::DISPATCH_PER_AXIS,
+);
             drop(compute);
             self.last_bake = Some(want_bake);
         }

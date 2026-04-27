@@ -37,3 +37,5 @@ compass_artifact_wf-112109fa-fb22-4a7d-92e0-0ba314232db7_text_markdown.md
 # Environment
 .env
 .env.local
+build_docs
+
