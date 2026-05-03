@@ -14,7 +14,9 @@ pub use gradient::GradientStop;
 pub use graph::ErebusRenderer;
 pub use uniforms::{
     FrameUniforms, LightingUniforms, NebulaUniforms, PostUniforms, StarfieldUniforms,
-    RENDER_MODE_CUBEMAP,
+    DENSITY_LEGACY, DENSITY_MULTICHANNEL, PALETTE_HOO, PALETTE_NATURAL, PHASE_CS, PHASE_HG,
+    REDDENING_GRAY, REDDENING_ISM, RENDER_MODE_CUBEMAP, SIGMA_LAW_CUSTOM, SIGMA_LAW_GRAY,
+    SIGMA_LAW_ISM, WARP_CURL, WARP_FBM,
 };
 #[cfg(target_arch = "wasm32")]
 pub use graph::PendingExport;

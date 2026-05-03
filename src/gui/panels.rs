@@ -605,9 +605,33 @@ fn nebula_group(ui: &mut egui::Ui, state: &mut State) {
 
             ui.separator();
             ui.label(egui::RichText::new("Domain warp").strong());
+            ui.horizontal(|ui| {
+                ui.label("kind").on_hover_text(
+                    "FBM = legacy 3-fetch divergent vector warp (cottony bulges). \
+                     Curl = divergence-free curl of three potentials (Bridson 2007); \
+                     produces flowing tendrils that match real ISM turbulence. \
+                     ~3× the warp cost — first frame after a slider change is slower; \
+                     cached frames are unaffected.",
+                );
+                let mut kind = n.warp_kind;
+                egui::ComboBox::from_id_salt("nebula_warp_kind")
+                    .selected_text(match kind {
+                        crate::render::WARP_CURL => "Curl (incompressible)",
+                        _ => "FBM (legacy)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kind, crate::render::WARP_FBM, "FBM (legacy)");
+                        ui.selectable_value(
+                            &mut kind,
+                            crate::render::WARP_CURL,
+                            "Curl (incompressible)",
+                        );
+                    });
+                n.warp_kind = kind;
+            });
             slider_tip(
                 ui, "warp strength", &mut n.warp_strength, 0.0..=4.0,
-                "Magnitude of the FBM displacement applied to the sample position. 0 = flat clouds, 1.5 = trifid tendrils, 4+ = chaos.",
+                "Magnitude of the displacement applied to the sample position. 0 = flat clouds, 1.5 = trifid tendrils, 4+ = chaos.",
             );
             slider_u32(ui, "octaves (warp)", &mut n.octaves_warp, 0..=6);
 
@@ -629,23 +653,228 @@ fn nebula_group(ui: &mut egui::Ui, state: &mut State) {
 
             ui.separator();
             ui.label(egui::RichText::new("Scattering").strong());
-            slider_tip(
-                ui, "extinction (σₑ)", &mut n.sigma_e, 0.1..=8.0,
-                "Beer–Lambert extinction per unit density per scene unit. ~0.3 = wispy haze, 1.5 = default, ~6 = bright Trifid-style core.",
-            );
+            extinction_controls(ui, n);
             slider_tip(
                 ui, "albedo", &mut n.albedo, 0.0..=1.0,
                 "σs / σe — fraction of extinguished light that re-scatters. 0.6 is Space Engine's default; lower for darker dust lanes.",
             );
+            ui.horizontal(|ui| {
+                ui.label("phase").on_hover_text(
+                    "Single-scattering phase function. HG = Henyey-Greenstein \
+                     (cheap, qualitatively wrong silver-lining). \
+                     Cornette-Shanks = HG + (1+cos²θ) correction term, \
+                     same cost, sharper forward peak (Cornette & Shanks 1992 — \
+                     the right physics for small particles).",
+                );
+                let mut kind = n.phase_kind;
+                egui::ComboBox::from_id_salt("nebula_phase_kind")
+                    .selected_text(match kind {
+                        crate::render::PHASE_CS => "Cornette-Shanks",
+                        _ => "HG (legacy)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kind, crate::render::PHASE_HG, "HG (legacy)");
+                        ui.selectable_value(
+                            &mut kind,
+                            crate::render::PHASE_CS,
+                            "Cornette-Shanks",
+                        );
+                    });
+                n.phase_kind = kind;
+            });
             slider_tip(
-                ui, "HG anisotropy (g)", &mut n.hg_g, -0.9..=0.9,
-                "Henyey–Greenstein phase function. 0 = isotropic clouds, 0.6 = forward-scatter dust (default), -0.3 = back-scatter rim.",
+                ui, "anisotropy (g)", &mut n.hg_g, -0.9..=0.9,
+                "Phase function eccentricity. 0 = isotropic clouds, 0.6 = forward-scatter dust (default), -0.3 = back-scatter rim. Used by both HG and Cornette-Shanks.",
             );
             slider_tip(
                 ui, "density curve (γ)", &mut n.density_curve, 0.25..=2.0,
                 "pow(d, γ) before the gradient LUT lookup. 0.5 (sqrt) lifts wispy tails; 1.0 = linear; 2.0 hides the tails entirely.",
             );
+
+            ui.separator();
+            ui.label(egui::RichText::new("Density distribution").strong());
+            slider_tip(
+                ui, "contrast", &mut n.density_contrast, 0.0..=8.0,
+                "Log-normal-ish density remap. 0 = legacy linear clip (back-compat); \
+                 1 = subtle bunching; 4 = dense cores ~1.5 EV brighter than thin tendrils \
+                 (matches observed cold-ISM statistics); 8 = ten decades of dynamic range. \
+                 Bump nebula march steps when raising past 4.",
+            );
+            slider_tip(
+                ui, "pivot", &mut n.density_pivot, 0.0..=1.0,
+                "Centre point of the remap on the underlying FBM histogram (mean ≈ 0.5). \
+                 Lower = more void, sharper cores. Only effective when contrast > 0.",
+            );
+
+            ui.separator();
+            ui.label(egui::RichText::new("Emission model").strong());
+            ui.horizontal(|ui| {
+                ui.label("density kind").on_hover_text(
+                    "LEGACY = mix(smooth, ridged) → density, gradient LUT colours \
+                     (Phase 5; matches v1 presets). MULTICHANNEL = separate Hα + \
+                     [OIII] emission lines + dust extinction (Phase 10.5 R3); \
+                     gradient LUT is ignored. Switch to MULTICHANNEL to use the \
+                     palette mode toggle and the Hα/[OIII]/dust strength sliders.",
+                );
+                let mut kind = n.density_kind;
+                egui::ComboBox::from_id_salt("nebula_density_kind")
+                    .selected_text(match kind {
+                        crate::render::DENSITY_MULTICHANNEL => "Multichannel (lines)",
+                        _ => "Legacy (gradient LUT)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut kind, crate::render::DENSITY_LEGACY, "Legacy (gradient LUT)");
+                        ui.selectable_value(
+                            &mut kind,
+                            crate::render::DENSITY_MULTICHANNEL,
+                            "Multichannel (lines)",
+                        );
+                    });
+                n.density_kind = kind;
+            });
+            if n.density_kind == crate::render::DENSITY_MULTICHANNEL {
+                ui.horizontal(|ui| {
+                    ui.label("palette").on_hover_text(
+                        "NATURAL = red Hα + teal [OIII] (what an eye through a \
+                         large telescope sees). HOO = red Hα + cyan [OIII] \
+                         (the popular two-line narrowband look). SHO is deferred \
+                         until the [SII] channel ships.",
+                    );
+                    let mut p = n.palette_mode;
+                    egui::ComboBox::from_id_salt("nebula_palette_mode")
+                        .selected_text(match p {
+                            crate::render::PALETTE_HOO => "HOO",
+                            _ => "NATURAL",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut p, crate::render::PALETTE_NATURAL, "NATURAL");
+                            ui.selectable_value(&mut p, crate::render::PALETTE_HOO, "HOO");
+                        });
+                    n.palette_mode = p;
+                });
+                slider_tip(
+                    ui, "Hα strength", &mut n.halpha_strength, 0.0..=4.0,
+                    "Multiplier on the smooth-FBM-driven Hα emission. \
+                     Hα at 656 nm dominates real emission nebulae; \
+                     this is the warm pink/red brightness.",
+                );
+                slider_tip(
+                    ui, "[OIII] strength", &mut n.oiii_strength, 0.0..=4.0,
+                    "Multiplier on the ridged-FBM-driven [OIII] emission. \
+                     [OIII] at 500.7 nm marks the hot inner ionised zones; \
+                     keep relatively dim or it overpowers the Hα.",
+                );
+                slider_tip(
+                    ui, "[OIII] sharpness", &mut n.oiii_power, 1.0..=8.0,
+                    "Power applied to the [OIII] field. 1 = same shape as Hα, \
+                     3 (default) = sharp inner core, 8 = pinpoint hot spots.",
+                );
+                slider_tip(
+                    ui, "dust strength", &mut n.dust_strength, 0.0..=4.0,
+                    "Multiplier on the dust-extinction field (smooth × ridged). \
+                     Dust drives Beer-Lambert extinction (per-channel, R2) so \
+                     stronger dust both darkens AND reddens the nebula.",
+                );
+            }
         });
+}
+
+/// R2 — extinction control. Combo selects the per-channel ratio (ISM /
+/// Gray / Custom); intensity slider scales it for ISM/Gray; in Custom mode
+/// the user edits R/G/B independently. The shader reads `n.sigma_e` directly
+/// — `n.sigma_e_law` is just a UI hint for which mode the panel is in.
+fn extinction_controls(ui: &mut egui::Ui, n: &mut crate::render::NebulaUniforms) {
+    use crate::render::{REDDENING_GRAY, REDDENING_ISM, SIGMA_LAW_CUSTOM, SIGMA_LAW_GRAY, SIGMA_LAW_ISM};
+
+    ui.horizontal(|ui| {
+        ui.label("reddening").on_hover_text(
+            "Per-channel extinction ratio. ISM = R_V=3.1 dust (blue ~2× more \
+             extinguished than red — interstellar reddening, default). \
+             Gray = wavelength-flat (back-compat with v1 presets). \
+             Custom = user RGB.",
+        );
+        let mut law = n.sigma_e_law;
+        let prev_law = law;
+        egui::ComboBox::from_id_salt("nebula_sigma_law")
+            .selected_text(match law {
+                SIGMA_LAW_GRAY => "Gray",
+                SIGMA_LAW_CUSTOM => "Custom",
+                _ => "ISM (R_V=3.1)",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut law, SIGMA_LAW_ISM, "ISM (R_V=3.1)");
+                ui.selectable_value(&mut law, SIGMA_LAW_GRAY, "Gray");
+                ui.selectable_value(&mut law, SIGMA_LAW_CUSTOM, "Custom");
+            });
+        // On law change, re-derive sigma_e so the user sees the visual
+        // effect immediately. Use the green channel as the "intensity"
+        // because the ISM ratio is normalised to G = 1.
+        if law != prev_law {
+            let intensity = n.sigma_e[1].max(0.01);
+            match law {
+                SIGMA_LAW_ISM => {
+                    n.sigma_e = [
+                        REDDENING_ISM[0] * intensity,
+                        REDDENING_ISM[1] * intensity,
+                        REDDENING_ISM[2] * intensity,
+                    ];
+                }
+                SIGMA_LAW_GRAY => {
+                    n.sigma_e = [
+                        REDDENING_GRAY[0] * intensity,
+                        REDDENING_GRAY[1] * intensity,
+                        REDDENING_GRAY[2] * intensity,
+                    ];
+                }
+                _ => {} // Custom: leave RGB as-is
+            }
+        }
+        n.sigma_e_law = law;
+    });
+
+    if n.sigma_e_law == SIGMA_LAW_CUSTOM {
+        slider_tip(
+            ui, "σₑ R", &mut n.sigma_e[0], 0.0..=8.0,
+            "Per-channel Beer-Lambert extinction. R: long wavelengths.",
+        );
+        slider_tip(
+            ui, "σₑ G", &mut n.sigma_e[1], 0.0..=8.0,
+            "Per-channel Beer-Lambert extinction. G: middle.",
+        );
+        slider_tip(
+            ui, "σₑ B", &mut n.sigma_e[2], 0.0..=8.0,
+            "Per-channel Beer-Lambert extinction. B: short wavelengths.",
+        );
+    } else {
+        // ISM/Gray: single intensity slider. Read green channel as the
+        // canonical scalar (ISM ratio normalised to G=1).
+        let mut intensity = n.sigma_e[1];
+        let prev = intensity;
+        ui.horizontal(|ui| {
+            ui.label("intensity").on_hover_text(
+                "Overall extinction strength. ~0.3 = wispy haze, 2 = default, \
+                 ~6 = bright Trifid-style core. Multiplied by the reddening ratio.",
+            );
+            ui.add(egui::Slider::new(&mut intensity, 0.0..=8.0));
+        });
+        if (intensity - prev).abs() > 1.0e-6 {
+            let ratio = if n.sigma_e_law == SIGMA_LAW_GRAY {
+                REDDENING_GRAY
+            } else {
+                REDDENING_ISM
+            };
+            n.sigma_e = [ratio[0] * intensity, ratio[1] * intensity, ratio[2] * intensity];
+        }
+        // Show the resulting RGB so users can see what dust is doing.
+        ui.label(
+            egui::RichText::new(format!(
+                "  σₑ ≈ R {:.2}  G {:.2}  B {:.2}",
+                n.sigma_e[0], n.sigma_e[1], n.sigma_e[2],
+            ))
+            .weak()
+            .monospace(),
+        );
+    }
 }
 
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) {

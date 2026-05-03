@@ -1,8 +1,13 @@
 // Bake a 128³ RGBA16F volume holding pre-computed FBM.
-//   R: smooth FBM (octaves of value-noise)
-//   G: ridged FBM (octaves of (1 - |2n - 1|)²)
-//   B: reserved
-//   A: 1.0
+//   R: smooth FBM (octaves of value-noise)        — Hα emission base in R3.2
+//   G: ridged FBM (octaves of (1 - |2n - 1|)²)    — [OIII] emission base in R3.2
+//   B: dust field (smooth × ridged, both clamped) — extinction base in R3.2
+//   A: reserved for [SII] (Phase R6)
+//
+// The R/G channels keep their old semantics so legacy density_kind = 0
+// (LEGACY) presets render identically. B is new in Phase 10.5 R3.1; old
+// presets in LEGACY mode never read it. New MULTICHANNEL presets drive
+// emission per line and extinction per dust column.
 //
 // Workgroup size 4×4×4 = 64 invocations — well below the 256-invocation
 // limit of every wgpu adapter. Dispatched 32×32×32 → 32k workgroups, each
@@ -104,10 +109,16 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let out_smooth = select(0.0, sum_smooth / norm, norm > 0.0);
     let out_ridged = select(0.0, sum_ridged / norm, norm > 0.0);
+    // Dust = smooth × ridged. Smooth supplies the cloud envelope; ridged
+    // gives the filamentary structure dust columns actually have. Product
+    // peaks where dense smooth regions intersect filaments — the right
+    // shape for dust lanes within emission nebulae. Clamped to keep the
+    // RGBA16F texel non-negative even with hashed FBM rounding.
+    let out_dust = clamp(out_smooth * out_ridged, 0.0, 1.0);
 
     textureStore(
         output,
         vec3<i32>(id),
-        vec4<f32>(out_smooth, out_ridged, 0.0, 1.0),
+        vec4<f32>(out_smooth, out_ridged, out_dust, 0.0),
     );
 }

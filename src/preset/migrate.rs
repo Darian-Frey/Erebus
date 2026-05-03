@@ -8,8 +8,15 @@ use crate::preset::schema::{Preset, CURRENT_VERSION};
 pub fn migrate(mut preset: Preset) -> Preset {
     while preset.format_version < CURRENT_VERSION {
         match preset.format_version {
-            // Add migration arms here as the schema evolves:
-            //   0 => preset = migrate_v0_to_v1(preset),
+            // v1 → v2 (Phase 10.5 R2): NebulaUniforms.sigma_e changed shape
+            // from f32 to [f32; 3]. The custom deserializer on the field
+            // handles either form, so by the time we get here the value is
+            // already a vec3 — no struct mutation needed. Several other
+            // fields gained serde defaults (warp_kind, phase_kind, etc.)
+            // and load fine without action. Just stamp the new version.
+            1 => {
+                preset.format_version = 2;
+            }
             other => {
                 log::warn!(
                     "preset is at unknown format_version {other}; loading as-is",

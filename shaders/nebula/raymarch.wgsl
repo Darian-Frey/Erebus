@@ -34,17 +34,38 @@ struct Nebula {
     ridged_blend: f32,
     warp_strength: f32,
     octaves_warp: u32,
-    _pad0: u32,
+    warp_kind: u32,    // 0 = FBM (legacy), 1 = curl-noise (divergence-free)
 
     steps: u32,
     march_length: f32,
     transmittance_cutoff: f32,
     step_density_bias: f32,
 
-    sigma_e: f32,
+    // R2 — per-channel extinction (interstellar reddening).
+    sigma_e: vec3<f32>,
+    _pad_sigma: f32,
+
     albedo: f32,
     hg_g: f32,
     density_curve: f32,
+    sigma_e_law: u32,       // R2 — UI-only hint, shader doesn't read it
+
+    // Phase R1.2 / R1.3 additions.
+    phase_kind: u32,        // 0 = HG (legacy), 1 = Cornette-Shanks
+    density_pivot: f32,     // R1.3 — log-normal remap centre
+    density_contrast: f32,  // R1.3 — 0 = legacy clip, >0 = exp remap dynamic range
+    _pad1: f32,
+
+    // R3 — multichannel emission.
+    density_kind: u32,      // 0 = LEGACY mix(smooth, ridged), 1 = MULTICHANNEL
+    palette_mode: u32,      // 0 = NATURAL, 1 = HOO
+    halpha_strength: f32,
+    oiii_strength: f32,
+
+    dust_strength: f32,
+    oiii_power: f32,        // power applied to [OIII] field (>1 = sharper inner zone)
+    _pad2: f32,
+    _pad3: f32,
 };
 
 struct PointLight {
@@ -153,9 +174,17 @@ fn noise_uvw(p: vec3<f32>) -> vec3<f32> {
     return p / NOISE_PERIOD_WORLD;
 }
 
-// Sample the baked FBM. Returns (smooth, ridged) in (.r, .g).
+// Sample the baked FBM. Returns (smooth, ridged) in (.r, .g) — back-compat
+// shape used by curl_warp + the legacy density path.
 fn sample_noise(p: vec3<f32>) -> vec2<f32> {
     return textureSampleLevel(noise_3d, noise_sampler, noise_uvw(p), 0.0).rg;
+}
+
+// Full 4-channel sample: (smooth/Hα, ridged/[OIII], dust, reserved).
+// Used by the multichannel emission path (R3.2). One texture fetch,
+// 4× wider read than `sample_noise` — about the same hardware cost.
+fn sample_noise_4(p: vec3<f32>) -> vec4<f32> {
+    return textureSampleLevel(noise_3d, noise_sampler, noise_uvw(p), 0.0);
 }
 
 // ---- Density ---------------------------------------------------------------
@@ -168,31 +197,131 @@ fn seed_offset() -> vec3<f32> {
     );
 }
 
-// Cheap density for shadow marching: skips the warp.
-fn shadow_density(p_in: vec3<f32>) -> f32 {
-    let p_scaled = p_in * nebula.density_scale + seed_offset();
-    let s = sample_noise(p_scaled).r;
-    return max(s - 0.45, 0.0) * 1.8;
-}
-
-fn nebula_density(p_in: vec3<f32>) -> f32 {
-    let p_scaled = p_in * nebula.density_scale + seed_offset();
-
-    // Domain warp: 3 fetches at decorrelated offsets, mapped to [-1, 1].
-    let w = vec3<f32>(
-        sample_noise(p_scaled + vec3<f32>(0.0, 0.0, 0.0)).r,
-        sample_noise(p_scaled + vec3<f32>(5.2, 1.3, 7.7)).r,
-        sample_noise(p_scaled + vec3<f32>(2.7, 9.1, 3.1)).r,
-    ) * 2.0 - 1.0;
-    let p_warped = p_scaled + nebula.warp_strength * w;
-
-    // Single fetch reads both smooth (R) and ridged (G).
-    let n = sample_noise(p_warped);
-    let shape = mix(n.r, n.g, nebula.ridged_blend);
+// Map a [0, 1] FBM shape value to a non-negative density. Two regimes:
+//   density_contrast ≤ 0  →  legacy linear clip `max(s - 0.45, 0) * 1.8`
+//   density_contrast > 0  →  log-normal-ish exp remap centred on
+//                            `density_pivot`. Real cold-ISM density follows
+//                            a log-normal distribution (Vazquez-Semadeni
+//                            1994); the remap restores the ~1.5 EV core /
+//                            tendril contrast the linear clip throws away.
+fn density_from_shape(shape: f32) -> f32 {
+    if (nebula.density_contrast > 1.0e-3) {
+        let centred = shape - nebula.density_pivot;
+        let exp_density = exp(centred * nebula.density_contrast);
+        // Subtract the value the remap takes at shape=0 so the noise floor
+        // stays at zero density (otherwise the void fills with thin haze).
+        let baseline = exp(-nebula.density_pivot * nebula.density_contrast);
+        return max(exp_density - baseline, 0.0);
+    }
     return max(shape - 0.45, 0.0) * 1.8;
 }
 
+// Cheap density for shadow marching: skips the warp.
+fn shadow_density(p_in: vec3<f32>) -> f32 {
+    let p_scaled = p_in * nebula.density_scale + seed_offset();
+    return density_from_shape(sample_noise(p_scaled).r);
+}
+
+// Curl of three decorrelated scalar potentials → divergence-free vector field
+// (Bridson 2007). Real ISM turbulence is dominantly solenoidal, so a curl
+// warp produces flowing tendril structure where the FBM-vector warp produces
+// cottony bulges (the FBM warp has divergence ~ curl in magnitude, half the
+// motion is compressive).
+//
+// 12 noise fetches per call (6 central differences). Offsets pa/pb/pc
+// decorrelate the three potentials. h = 0.125 ≈ 1.6 % of NOISE_PERIOD_WORLD,
+// trades off finite-difference attenuation (sin(hk)/k) against f32 precision
+// inside the trilinear-filtered noise volume — about 2 texels at native 128³
+// noise, 1 texel at wasm 64³.
+fn curl_warp(p_in: vec3<f32>) -> vec3<f32> {
+    let h = 0.125;
+    let inv_2h = 1.0 / (2.0 * h);
+    let dx = vec3<f32>(h, 0.0, 0.0);
+    let dy = vec3<f32>(0.0, h, 0.0);
+    let dz = vec3<f32>(0.0, 0.0, h);
+
+    let pa = vec3<f32>(11.7,  0.0,  0.0);   // psi_x base offset
+    let pb = vec3<f32>( 0.0, 23.3,  0.0);   // psi_y base offset
+    let pc = vec3<f32>( 0.0,  0.0, 31.1);   // psi_z base offset
+
+    // Six unique partial derivatives. 12 noise fetches.
+    let dpsi_x_dy = (sample_noise(p_in + pa + dy).r - sample_noise(p_in + pa - dy).r) * inv_2h;
+    let dpsi_x_dz = (sample_noise(p_in + pa + dz).r - sample_noise(p_in + pa - dz).r) * inv_2h;
+    let dpsi_y_dx = (sample_noise(p_in + pb + dx).r - sample_noise(p_in + pb - dx).r) * inv_2h;
+    let dpsi_y_dz = (sample_noise(p_in + pb + dz).r - sample_noise(p_in + pb - dz).r) * inv_2h;
+    let dpsi_z_dx = (sample_noise(p_in + pc + dx).r - sample_noise(p_in + pc - dx).r) * inv_2h;
+    let dpsi_z_dy = (sample_noise(p_in + pc + dy).r - sample_noise(p_in + pc - dy).r) * inv_2h;
+
+    return vec3<f32>(
+        dpsi_z_dy - dpsi_y_dz,
+        dpsi_x_dz - dpsi_z_dx,
+        dpsi_y_dx - dpsi_x_dy,
+    );
+}
+
+// Apply the domain warp and return the shifted sample position. Shared by
+// `nebula_density` (legacy path) and the multichannel raymarch (R3.2).
+fn warp_point(p_in: vec3<f32>) -> vec3<f32> {
+    let p_scaled = p_in * nebula.density_scale + seed_offset();
+    var w: vec3<f32>;
+    if (nebula.warp_kind == 1u) {
+        // Curl-noise warp. Output magnitude is roughly proportional to the
+        // potential gradient; scale to roughly match the legacy warp's
+        // [-1, 1] amplitude so existing `warp_strength` slider feels similar.
+        w = curl_warp(p_scaled) * 1.5;
+    } else {
+        // Legacy FBM-vector warp. 3 decorrelated fetches → [-1, 1].
+        w = vec3<f32>(
+            sample_noise(p_scaled).r,
+            sample_noise(p_scaled + vec3<f32>(5.2, 1.3, 7.7)).r,
+            sample_noise(p_scaled + vec3<f32>(2.7, 9.1, 3.1)).r,
+        ) * 2.0 - 1.0;
+    }
+    return p_scaled + nebula.warp_strength * w;
+}
+
+fn nebula_density(p_in: vec3<f32>) -> f32 {
+    let p_warped = warp_point(p_in);
+    // Single fetch reads both smooth (R) and ridged (G).
+    let n = sample_noise(p_warped);
+    let shape = mix(n.r, n.g, nebula.ridged_blend);
+    return density_from_shape(shape);
+}
+
+// R3.2 — sample the per-channel emission/extinction model. Returns
+// (halpha, oiii, dust) in (.x, .y, .z); .w reserved for [SII] / future use.
+// One 4-channel texture fetch + a few cheap ALU ops.
+fn nebula_multichannel(p_in: vec3<f32>) -> vec4<f32> {
+    let p_warped = warp_point(p_in);
+    let n = sample_noise_4(p_warped);
+    let halpha = max(n.r - 0.45, 0.0) * nebula.halpha_strength;
+    // [OIII] cutoff is higher and gets a power applied → sharper inner zone.
+    let oiii = pow(max(n.g - 0.50, 0.0), nebula.oiii_power) * nebula.oiii_strength;
+    // Dust uses a shallow cutoff so lanes show through even in thin regions.
+    let dust = max(n.b - 0.05, 0.0) * nebula.dust_strength;
+    return vec4<f32>(halpha, oiii, dust, 0.0);
+}
+
 // ---- Sampling helpers ------------------------------------------------------
+
+// Cornette & Shanks (1992), Applied Optics 31(16):3152–3160. Drop-in HG
+// replacement that satisfies a single-scattering symmetry HG violates and
+// gives a tighter forward peak / softer back lobe at the same cost — one
+// extra `(1 + cos²θ)` term.
+fn cornette_shanks(cos_theta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    let denom = max(1.0 + g2 - 2.0 * g * cos_theta, 1e-3);
+    let num = 3.0 * (1.0 - g2) * (1.0 + cos_theta * cos_theta);
+    let den = 8.0 * PI * (2.0 + g2) * pow(denom, 1.5);
+    return num / den;
+}
+
+fn phase_function(cos_theta: f32, g: f32) -> f32 {
+    if (nebula.phase_kind == 1u) {
+        return cornette_shanks(cos_theta, g);
+    }
+    return henyey_greenstein(cos_theta, g);
+}
 
 fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
@@ -224,15 +353,18 @@ fn sample_lights(p: vec3<f32>, view_dir: vec3<f32>) -> vec3<f32> {
         let l_dir = to_light / dist;
 
         let cos_theta = dot(view_dir, l_dir);
-        let phase = henyey_greenstein(cos_theta, nebula.hg_g);
+        let phase = phase_function(cos_theta, nebula.hg_g);
 
         let shadow_dt = dist / f32(s);
-        var shadow_optical: f32 = 0.0;
+        var shadow_optical = vec3<f32>(0.0);
         for (var k: u32 = 0u; k < s; k = k + 1u) {
             let sp = p + l_dir * (shadow_dt * (f32(k) + 0.5));
             shadow_optical = shadow_optical
                 + nebula.sigma_e * shadow_density(sp) * shadow_dt;
-            if (shadow_optical > 6.0) {
+            // R2: per-channel extinction. Stop only when ALL channels are
+            // effectively dark — `min` is the conservative test (a light
+            // could still contribute via the least-extinguished channel).
+            if (min(shadow_optical.r, min(shadow_optical.g, shadow_optical.b)) > 6.0) {
                 break;
             }
         }
@@ -403,38 +535,94 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
     let jitter = ign(pixel) * dt_base;
 
     var colour = vec3<f32>(0.0);
-    var transmittance: f32 = 1.0;
+    // R2 — transmittance is per-channel so dust reddens transmitted light
+    // (interstellar reddening). Beer-Lambert applied per channel below.
+    var transmittance = vec3<f32>(1.0);
     var t = jitter;
 
     for (var i: u32 = 0u; i < steps; i = i + 1u) {
         let p = origin + dir * t;
-        let d = nebula_density(p);
 
-        // Density-adaptive step: denser regions take smaller steps.
+        // R3.2 — pick density model. LEGACY uses a single mix(smooth, ridged)
+        // density; MULTICHANNEL evaluates Hα + [OIII] + dust separately.
+        var d: f32;
+        var halpha: f32 = 0.0;
+        var oiii: f32 = 0.0;
+        if (nebula.density_kind == 1u) {
+            let mc = nebula_multichannel(p);
+            halpha = mc.x;
+            oiii = mc.y;
+            d = mc.z;  // dust drives extinction + adaptive stepping
+        } else {
+            d = nebula_density(p);
+        }
+
+        // Density-adaptive step: denser regions take smaller steps. In
+        // multichannel mode `d` is dust, which is the right driver because
+        // dust is what eats light along the ray.
         let dt = dt_base * max(0.25, nebula.step_density_bias - d);
 
-        if (d > 0.001) {
-            let sigma_e = nebula.sigma_e * d;
-            let optical = sigma_e * dt;
-            let absorbed = 1.0 - exp(-optical);
-
-            let lut_t = clamp(pow(d, nebula.density_curve), 0.0, 1.0);
-            // textureSampleLevel (not textureSample) because we're inside
-            // non-uniform control flow (loop with break). WebGPU's strict
-            // spec rejects implicit-LOD textureSample from divergent paths.
-            let albedo_color = textureSampleLevel(gradient_tex, gradient_sampler, lut_t, 0.0).rgb;
+        // Skip step entirely only when nothing is contributing — note
+        // emission lines can light up regions with very thin dust.
+        if (d > 0.001 || halpha > 0.001 || oiii > 0.001) {
+            // R2 — per-channel extinction. sigma_e is vec3.
+            let optical = nebula.sigma_e * d * dt;
+            let absorbed = vec3<f32>(1.0) - exp(-optical);
 
             var in_scatter = vec3<f32>(0.0);
-            if (d > 0.05 && lighting.count > 0u) {
-                in_scatter = sample_lights(p, dir) * albedo_color * nebula.albedo;
+            var self_emission = vec3<f32>(0.0);
+            var emission = vec3<f32>(0.0);
+
+            if (nebula.density_kind == 1u) {
+                // R3.2 — emission per spectral line at fixed sRGB peaks.
+                // Hα = 656 nm → red. [OIII] = 500.7 nm → teal in NATURAL,
+                // remapped to cyan in HOO so the line shows on a different
+                // primary than Hα. `emission * dt` integrates the volumetric
+                // line emissivity; `absorbed` factor in scattering.
+                let halpha_color = vec3<f32>(1.00, 0.05, 0.10);
+                var oiii_color: vec3<f32>;
+                if (nebula.palette_mode == 1u) {
+                    // HOO: Hα → R, [OIII] → cyan rim (G + B)
+                    oiii_color = vec3<f32>(0.0, 0.7, 1.0);
+                } else {
+                    // NATURAL: teal core (slightly green-biased)
+                    oiii_color = vec3<f32>(0.0, 1.0, 0.7);
+                }
+                emission = halpha * halpha_color + oiii * oiii_color;
+
+                // Dust scatters in-volume lighting; uses the per-step albedo
+                // colour as in legacy (or, when no LUT path, gray albedo).
+                if (d > 0.05 && lighting.count > 0u) {
+                    in_scatter = sample_lights(p, dir) * nebula.albedo;
+                }
+                self_emission = vec3<f32>(lighting.ambient_emission);
+            } else {
+                // LEGACY — gradient LUT drives both emission colour and
+                // dust albedo. Identical to Phase 5 behaviour.
+                let lut_t = clamp(pow(d, nebula.density_curve), 0.0, 1.0);
+                // textureSampleLevel (not textureSample) because we're inside
+                // non-uniform control flow (loop with break). WebGPU's strict
+                // spec rejects implicit-LOD textureSample from divergent paths.
+                let albedo_color = textureSampleLevel(gradient_tex, gradient_sampler, lut_t, 0.0).rgb;
+                if (d > 0.05 && lighting.count > 0u) {
+                    in_scatter = sample_lights(p, dir) * albedo_color * nebula.albedo;
+                }
+                self_emission = albedo_color * lighting.ambient_emission;
             }
 
-            let self_emission = albedo_color * lighting.ambient_emission;
-
-            colour = colour + transmittance * absorbed * (in_scatter + self_emission);
+            // Composition. Emission integrates over the path length; in-scatter
+            // is gated by the absorbed fraction of the step (energy actually
+            // interacted with dust along this dt).
+            colour = colour
+                + transmittance * (absorbed * (in_scatter + self_emission) + emission * dt);
 
             transmittance = transmittance * exp(-optical);
-            if (transmittance < nebula.transmittance_cutoff) {
+            // Per-channel transmittance cutoff: stop only when even the
+            // longest-mean-free-path channel (red, under ISM reddening) has
+            // dropped below the cutoff.
+            if (max(transmittance.r, max(transmittance.g, transmittance.b))
+                < nebula.transmittance_cutoff)
+            {
                 break;
             }
         }
@@ -447,6 +635,7 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
 
     // Stars lie behind the nebula at infinity — `transmittance` after the
     // march is exactly the fraction of background light reaching the camera.
+    // Per-channel attenuation reddens distant stars seen through dust columns.
     let stars = sample_starfield(dir) * transmittance;
     let final_colour = colour + stars;
 

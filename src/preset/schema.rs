@@ -8,7 +8,12 @@ use crate::render::{
     GradientStop, LightingUniforms, NebulaUniforms, PostUniforms, StarfieldUniforms,
 };
 
-pub const CURRENT_VERSION: u32 = 1;
+/// Bump rules:
+/// - v1 → v2: NebulaUniforms.sigma_e changed from `f32` to `[f32; 3]` (R2);
+///   plus several optional fields added throughout (warp_kind, phase_kind,
+///   density_pivot/contrast, sigma_e_law). Old v1 presets load cleanly via
+///   serde defaults + custom deserializer for sigma_e — no walk needed.
+pub const CURRENT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preset {

@@ -289,6 +289,71 @@ impl Default for LightingUniforms {
     }
 }
 
+/// Domain-warp algorithm selector. See [`NebulaUniforms::warp_kind`].
+pub const WARP_FBM: u32 = 0;
+pub const WARP_CURL: u32 = 1;
+
+/// Single-scattering phase function selector. See [`NebulaUniforms::phase_kind`].
+pub const PHASE_HG: u32 = 0; // Henyey-Greenstein (legacy)
+pub const PHASE_CS: u32 = 1; // Cornette-Shanks (gas-like, default)
+
+/// Per-channel extinction "reddening law" UI selector. See
+/// [`NebulaUniforms::sigma_e_law`].
+pub const SIGMA_LAW_ISM: u32 = 0;    // R_V = 3.1 interstellar (default)
+pub const SIGMA_LAW_GRAY: u32 = 1;   // wavelength-flat (no reddening)
+pub const SIGMA_LAW_CUSTOM: u32 = 2; // user RGB
+
+/// Density / emission model selector. See [`NebulaUniforms::density_kind`].
+pub const DENSITY_LEGACY: u32 = 0;       // mix(smooth, ridged) → density (Phase 2)
+pub const DENSITY_MULTICHANNEL: u32 = 1; // separate Hα / [OIII] / dust (Phase 10.5 R3)
+
+/// Palette mode for multichannel emission. See [`NebulaUniforms::palette_mode`].
+pub const PALETTE_NATURAL: u32 = 0;      // Hα → red, [OIII] → teal
+pub const PALETTE_HOO: u32 = 1;          // Hα → R, [OIII] → G+B (cyan rim)
+
+/// Reference per-channel extinction ratios. The R, G, B values approximate
+/// Mathis-Rumpl-Nordsieck dust normalised so that G = 1.0 (R_V = 3.1).
+pub const REDDENING_ISM: [f32; 3] = [0.65, 1.00, 1.45];
+pub const REDDENING_GRAY: [f32; 3] = [1.00, 1.00, 1.00];
+
+/// Custom serde deserializer that accepts either a scalar (legacy v1 preset)
+/// or a 3-element array (current shape) for `NebulaUniforms::sigma_e`.
+/// Lets old presets load without a format-version migration walk.
+fn deserialize_sigma_e<'de, D>(deserializer: D) -> Result<[f32; 3], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::fmt;
+    struct ScalarOrSeq;
+    impl<'de> serde::de::Visitor<'de> for ScalarOrSeq {
+        type Value = [f32; 3];
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a scalar number or a 3-element array")
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<[f32; 3], E> {
+            Ok([v as f32; 3])
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<[f32; 3], E> {
+            Ok([v as f32; 3])
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<[f32; 3], E> {
+            Ok([v as f32; 3])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<[f32; 3], A::Error> {
+            use serde::de::Error;
+            let r = seq.next_element::<f32>()?.ok_or_else(|| A::Error::custom("missing R"))?;
+            let g = seq.next_element::<f32>()?.ok_or_else(|| A::Error::custom("missing G"))?;
+            let b = seq.next_element::<f32>()?.ok_or_else(|| A::Error::custom("missing B"))?;
+            Ok([r, g, b])
+        }
+    }
+    deserializer.deserialize_any(ScalarOrSeq)
+}
+
+fn default_sigma_e() -> [f32; 3] {
+    [REDDENING_ISM[0] * 2.0, REDDENING_ISM[1] * 2.0, REDDENING_ISM[2] * 2.0]
+}
+
 // Nebula raymarch parameters. All vec4-aligned for std140-compatible layout.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, Serialize, Deserialize)]
@@ -302,8 +367,13 @@ pub struct NebulaUniforms {
     pub ridged_blend: f32,
     pub warp_strength: f32,
     pub octaves_warp: u32,
-    #[serde(skip, default = "zero_u32")]
-    pub _pad0: u32,
+    /// Domain-warp algorithm. `WARP_FBM = 0` (legacy: 3 decorrelated FBM
+    /// fetches mapped to [-1, 1]) or `WARP_CURL = 1` (Bridson 2007: finite-
+    /// difference curl of three scalar potentials → divergence-free vector
+    /// field, produces flowing tendrils instead of cottony bulges).
+    /// Old presets without this field fall back to FBM via the serde default.
+    #[serde(default = "zero_u32")]
+    pub warp_kind: u32,
 
     // March
     pub steps: u32,
@@ -311,11 +381,88 @@ pub struct NebulaUniforms {
     pub transmittance_cutoff: f32,
     pub step_density_bias: f32,
 
-    // Scattering
-    pub sigma_e: f32,
+    // Scattering — sigma_e is per-channel (R2). std140 requires the vec3 to
+    // be 16-byte-aligned with 4 bytes of trailing padding before the next
+    // field, so it gets its own vec4 slot.
+    /// Beer-Lambert extinction per RGB channel. Default ISM ratio at
+    /// R_V = 3.1 makes blue ~2× more extinguished than red — interstellar
+    /// reddening. Old v1 presets stored this as a scalar; the custom
+    /// deserializer broadcasts that to all three channels.
+    #[serde(default = "default_sigma_e", deserialize_with = "deserialize_sigma_e")]
+    pub sigma_e: [f32; 3],
+    #[serde(skip, default = "zero_f32")]
+    pub _pad_sigma: f32,
+
     pub albedo: f32,
     pub hg_g: f32,
     pub density_curve: f32, // gamma applied to density before LUT lookup (0.5 = sqrt)
+    /// UI hint: which "reddening law" the slider in the panel is currently
+    /// modelling. Doesn't change the GPU value (sigma_e drives that
+    /// directly); only used by the panel to remap the user's intensity
+    /// slider when they switch laws. `SIGMA_LAW_ISM` (default) /
+    /// `SIGMA_LAW_GRAY` / `SIGMA_LAW_CUSTOM`.
+    #[serde(default = "zero_u32")]
+    pub sigma_e_law: u32,
+
+    // Phase R1.2 / R1.3 additions. New rows so existing Phase-3 fields keep
+    // their offsets — old presets without these load with serde defaults.
+    /// Single-scattering phase function. `PHASE_HG = 0` (legacy) or
+    /// `PHASE_CS = 1` (Cornette-Shanks; sharper forward peak, satisfies
+    /// the symmetry HG violates). New presets default to CS.
+    #[serde(default = "zero_u32")]
+    pub phase_kind: u32,
+    /// (R1.3 placeholder.) Pivot point for the log-normal density remap.
+    #[serde(default = "default_density_pivot")]
+    pub density_pivot: f32,
+    /// (R1.3 placeholder.) Dynamic-range exponent for the density remap.
+    /// 0 = legacy linear cutoff; >0 enables the log-normal-ish remap.
+    #[serde(default = "zero_f32")]
+    pub density_contrast: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub _pad1: f32,
+
+    // Phase 10.5 R3 — multichannel emission. `density_kind` selects between
+    // the legacy `mix(smooth, ridged) → density` path (back-compat) and the
+    // per-line emission model (Hα + [OIII] from baked R/G channels, dust
+    // from baked B). Palette mode remaps the emission RGB just before
+    // accumulation so NATURAL vs HOO can swap without a re-bake.
+    #[serde(default = "zero_u32")]
+    pub density_kind: u32,
+    #[serde(default = "zero_u32")]
+    pub palette_mode: u32,
+    #[serde(default = "default_halpha_strength")]
+    pub halpha_strength: f32,
+    #[serde(default = "default_oiii_strength")]
+    pub oiii_strength: f32,
+
+    #[serde(default = "default_dust_strength")]
+    pub dust_strength: f32,
+    /// Power applied to the [OIII] field after cutoff. >1 → sharper inner
+    /// ionised zone. 1 = same shape as Hα; default 3 gives the classic
+    /// teal-core-inside-pink-shell look.
+    #[serde(default = "default_oiii_power")]
+    pub oiii_power: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub _pad2: f32,
+    #[serde(skip, default = "zero_f32")]
+    pub _pad3: f32,
+}
+
+fn default_halpha_strength() -> f32 {
+    1.0
+}
+fn default_oiii_strength() -> f32 {
+    0.5
+}
+fn default_dust_strength() -> f32 {
+    1.0
+}
+fn default_oiii_power() -> f32 {
+    3.0
+}
+
+fn default_density_pivot() -> f32 {
+    0.5
 }
 
 impl Default for NebulaUniforms {
@@ -335,17 +482,34 @@ impl Default for NebulaUniforms {
             ridged_blend: 0.5,
             warp_strength: 1.5,
             octaves_warp: 3,
-            _pad0: 0,
+            warp_kind: WARP_CURL,
 
             steps: 96,
             march_length: 1.0,
             transmittance_cutoff: 0.01,
             step_density_bias: 1.5,
 
-            sigma_e: 2.0,
+            sigma_e: default_sigma_e(), // ISM ratio × intensity 2.0
+            _pad_sigma: 0.0,
             albedo: 0.6,
             hg_g: 0.6,
             density_curve: 0.5,
+            sigma_e_law: SIGMA_LAW_ISM,
+
+            phase_kind: PHASE_CS,
+            density_pivot: 0.5,
+            density_contrast: 0.0, // R1.3 disabled by default until tuned per-preset
+            _pad1: 0.0,
+
+            density_kind: DENSITY_LEGACY, // back-compat — opt in via Nebula panel
+            palette_mode: PALETTE_NATURAL,
+            halpha_strength: default_halpha_strength(),
+            oiii_strength: default_oiii_strength(),
+
+            dust_strength: default_dust_strength(),
+            oiii_power: default_oiii_power(),
+            _pad2: 0.0,
+            _pad3: 0.0,
         }
     }
 }

@@ -258,6 +258,24 @@ wasm-bindgen --target web --out-dir assets/web \
 
 ---
 
+## Phase 10.5 — Physical-realism foundations (R-series subset)
+
+**Goal:** front-load the small physics-driven shader upgrades that make the rest of the v1.x roadmap (especially Phase 13 nebula variants) coherent rather than an architectural retro-fit. Pulled from [build_docs/REALISM_HANDOFF.md](../build_docs/REALISM_HANDOFF.md). R4 (multi-scatter), R7 (Airy core), R8 (FFT bloom — overlaps Phase 11), and R9 (4D noise) are deferred.
+
+- [x] **R1.1 — Curl-noise warp** ([shaders/nebula/raymarch.wgsl](../shaders/nebula/raymarch.wgsl)). Replace the divergence-bearing FBM-vector domain warp with a divergence-free vector field via finite-difference curl of three decorrelated scalar potentials. Long flowing tendrils instead of cottony bulges (Bridson 2007). UI selector (`Domain warp → kind`) lets users compare against the legacy FBM warp; new state defaults to curl, shipped presets keep FBM until re-baked.
+- [x] **R1.2 — Cornette-Shanks phase function**. Drop-in replacement for HG; satisfies symmetry HG violates and gives a tighter forward peak. `phase_kind` selector (HG / CS) wired to the Scattering panel; new presets default to CS, old presets keep HG via serde default.
+- [x] **R1.3 — Log-normal density remap**. New `density_pivot` + `density_contrast` uniforms drive an exponential remap of the FBM shape via `density_from_shape()` (used by both `nebula_density` and `shadow_density`). `density_contrast = 0` falls back to the legacy linear clip so old presets render unchanged.
+- [x] **R2 — Wavelength-dependent extinction (interstellar reddening)**. `nebula.sigma_e` is now `[f32; 3]`; raymarch `transmittance` likewise; shadow-march early-out is per-channel `min(...) > 6`. Default ratio `[0.65, 1.00, 1.45]` matches ISM R_V=3.1. GUI replaces the scalar slider with reddening-law combo (ISM / Gray / Custom) + intensity slider; Custom mode exposes per-channel R/G/B sliders. Preset format bumped to v2; v1 presets load via a custom `deserialize_with` that broadcasts the legacy scalar to all three channels (Gray dust, identical to old behaviour).
+- [x] **R3.1 — Multi-channel baked volume**. The previously-reserved B channel of [shaders/compute/bake_3d_noise.wgsl](../shaders/compute/bake_3d_noise.wgsl) now stores `smooth × ridged` — a dust field with filament structure. R/G keep their existing smooth/ridged FBM semantics so legacy presets render unchanged. New `sample_noise_4` helper exposes the full vec4.
+- [x] **R3.2 — Multi-channel raymarch**. New `nebula_multichannel(p)` returns `(halpha, oiii, dust)`. `density_kind` selector (`DENSITY_LEGACY` / `DENSITY_MULTICHANNEL`) branches the main raymarch loop; LEGACY keeps the gradient-LUT pipeline untouched, MULTICHANNEL drives emission per spectral line and extinction from dust. Raymarch composition: `transmittance * (absorbed * (in_scatter + self_emission) + emission * dt)`. Per-channel σ_e (R2) reddens the dust extinction automatically.
+- [x] **R3.3 — Palette mode toggle**. `palette_mode` (`PALETTE_NATURAL = 0`, `PALETTE_HOO = 1`) read by the raymarch when `density_kind == MULTICHANNEL`. NATURAL = red Hα + teal [OIII] (eye-through-telescope). HOO = red Hα + cyan [OIII] (popular two-line narrowband). SHO is deferred until the [SII] channel ships in a later phase. UI: combo box appears under Emission model when MULTICHANNEL is selected.
+
+**Exit:** the existing three shipped presets render visibly more like real nebula photography (red emission, blue dust scattering, dust lanes that redden background stars). Phase 13 nebula variants become a presets-and-tuning job rather than an architectural change. Performance: budget +2.5 ms at preview / 1K-128 on the dev machine; wasm idle stays at 60 fps blit thanks to the existing freeze.
+
+**Migration:** preset format version bump. Defaults for new fields preserve current behaviour for old presets (`sigma_e = [1, 1, 1]`, `palette_mode = 0`, etc.).
+
+---
+
 ## Phase 10 — Release (M8)
 
 **Goal:** ship to itch.io at $8–$15.
