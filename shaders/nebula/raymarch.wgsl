@@ -633,13 +633,12 @@ fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
         }
     }
 
-    // Stars lie behind the nebula at infinity — `transmittance` after the
-    // march is exactly the fraction of background light reaching the camera.
-    // Per-channel attenuation reddens distant stars seen through dust columns.
-    let stars = sample_starfield(dir) * transmittance;
-    let final_colour = colour + stars;
-
-    // Exposure moved to the post pass (Phase 5) so bloom thresholds against
-    // unexposed scene radiance.
-    return vec4<f32>(final_colour, 1.0);
+    // Stars are no longer drawn here — they're evaluated in screen space by
+    // the composite pass so they don't get smeared by the equirect → canvas
+    // resample in skybox view. `transmittance` (the residual fraction of
+    // background light at this direction after the dust march) is encoded
+    // in the HDR alpha channel; composite reads it back to attenuate the
+    // screen-space starfield by foreground dust. Use the green channel as
+    // the canonical scalar (ISM reddening is normalised to G = 1).
+    return vec4<f32>(colour, transmittance.g);
 }

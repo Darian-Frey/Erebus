@@ -187,6 +187,12 @@ impl ErebusRenderer {
             &bloom.mips[0],
             &sampler,
             &post_buffer,
+            &noise_volume.view,
+            &noise_sampler,
+            &blackbody.view,
+            &blackbody_sampler,
+            &starfield_buffer,
+            &frame_buffer,
         );
 
         // ShaderWatcher takes a path so the API stays uniform; the WASM
@@ -304,6 +310,12 @@ impl ErebusRenderer {
             &self.bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
     }
 
@@ -544,6 +556,12 @@ impl ErebusRenderer {
             &export_bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
 
         // Push the per-frame uniforms — same as the live `prepare()` pass,
@@ -817,6 +835,12 @@ impl ErebusRenderer {
             &export_bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
 
         // Static uniforms — same across all six faces.
@@ -1016,6 +1040,12 @@ impl ErebusRenderer {
             &export_bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
 
         // Force linear passthrough + disable deband; everything else stays
@@ -1202,6 +1232,12 @@ impl ErebusRenderer {
             &bench_bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
 
         let mut f = frame;
@@ -1379,6 +1415,12 @@ impl ErebusRenderer {
             &export_bloom.mips[0],
             &self.sampler,
             &self.post_buffer,
+            &self.noise_volume.view,
+            &self.noise_sampler,
+            &self.blackbody.view,
+            &self.blackbody_sampler,
+            &self.starfield_buffer,
+            &self.frame_buffer,
         );
 
         let mut f = frame;
@@ -2013,10 +2055,66 @@ fn create_tonemap_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // Phase 10.5++ — starfield in composite. Five extra bindings:
+            // noise volume + sampler, blackbody LUT + sampler, starfield UBO,
+            // frame UBO (need frame.seed + frame.mode + frame.cube_face).
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D1,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_tonemap_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -2024,6 +2122,12 @@ fn create_tonemap_bg(
     bloom_mip0: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
     post_buffer: &wgpu::Buffer,
+    noise_3d: &wgpu::TextureView,
+    noise_sampler: &wgpu::Sampler,
+    blackbody_view: &wgpu::TextureView,
+    blackbody_sampler: &wgpu::Sampler,
+    starfield_buffer: &wgpu::Buffer,
+    frame_buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("erebus.bg.tonemap"),
@@ -2033,6 +2137,12 @@ fn create_tonemap_bg(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(bloom_mip0) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 3, resource: post_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(noise_3d) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(noise_sampler) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(blackbody_view) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(blackbody_sampler) },
+            wgpu::BindGroupEntry { binding: 8, resource: starfield_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: frame_buffer.as_entire_binding() },
         ],
     })
 }
