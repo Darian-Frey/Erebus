@@ -276,19 +276,19 @@ wasm-bindgen --target web --out-dir assets/web \
 
 ---
 
-## Phase 10 — Release (M8)
+## Phase 10 — Release (M8) — IN PROGRESS
 
-**Goal:** ship to itch.io at $8–$15.
+**Goal:** ship v1.0 to itch.io at $8–$15. Phases 11–15 ship after as free v1.x updates.
 
+- [x] User manual ([docs/USER_MANUAL.md](USER_MANUAL.md)) — single-file end-user guide covering quickstart, view modes, panel reference (every slider), recipes, export formats with engine drop-in instructions, performance tiers, web vs native differences, troubleshooting, determinism, physics references appendix.
 - [ ] Demo gallery: 12+ curated stills covering aesthetic range.
 - [ ] Trailer / GIF reel.
 - [ ] Itch.io page copy, screenshots, system requirements.
 - [ ] Native installers: signed Windows `.exe`, notarised macOS `.dmg`, Linux `.AppImage` + `.tar.gz`.
 - [ ] Public web demo (Phase 9 build) embedded on the itch.io page.
 - [ ] Changelog and version-1.0 tag.
-- [ ] Post-release roadmap: animated nebulae (4D noise time slice), procedural galaxies, ray-marched dust silhouettes against bright stars.
 
-**Exit:** v1.0 release. Customers can buy and download.
+**Exit:** v1.0 release. Customers can buy and download. Phases 11–15 then queue as v1.1+ free updates per the original roadmap order.
 
 ---
 
